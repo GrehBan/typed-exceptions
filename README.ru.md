@@ -61,7 +61,8 @@ Python 3.14+.
 - Обязательные поля, значения по умолчанию и фабрики по умолчанию
 - Совместимость с `dataclasses.field`
 - Шаблоны сообщений с простыми заполнителями `{field_name}`
-- Буквальное переопределение сообщения
+- Буквальное переопределение сообщения и шаблон, заданный для экземпляра
+- Сообщение, которое следует за используемыми полями при их переприсваивании
 - Структурированное отображение `context` в порядке объявления
 - Скрытие через `field(redact=True)`, метаданные dataclass, `Redact[T]` или
   `__redact__`
@@ -103,7 +104,7 @@ pip install .
 ## Быстрый старт
 
 ```python
-from typed_exceptions.exception import TypedException
+from typed_exceptions import TypedException
 
 
 class UserNotFound(TypedException):
@@ -113,11 +114,11 @@ class UserNotFound(TypedException):
 
 error = UserNotFound(user_id=42)
 
-print(str(error))        # User 42 was not found
-print(error.message)     # User 42 was not found
-print(error.args)        # ('User 42 was not found',)
-print(error.context)     # {'user_id': 42}
-print(error.user_id)     # 42
+print(str(error))  # User 42 was not found
+print(error.message)  # User 42 was not found
+print(error.args)  # ('User 42 was not found',)
+print(error.context)  # {'user_id': 42}
+print(error.user_id)  # 42
 ```
 
 `TypedException` — обычный подкласс `Exception`, поэтому его можно возбуждать
@@ -136,7 +137,7 @@ except UserNotFound as error:
 Используйте `message_template`, чтобы задать способ отрисовки сообщения.
 
 ```python
-from typed_exceptions.exception import TypedException
+from typed_exceptions import TypedException
 
 
 class InvalidToken(TypedException):
@@ -150,7 +151,7 @@ class InvalidToken(TypedException):
 
 ```python
 InvalidToken(token_id="abc", scope="admin")  # OK
-InvalidToken(scope="admin")                  # TypeError: missing 'token_id'
+InvalidToken(scope="admin")  # TypeError: missing 'token_id'
 ```
 
 Конструктор принимает только именованные аргументы. Позиционные аргументы
@@ -158,7 +159,7 @@ InvalidToken(scope="admin")                  # TypeError: missing 'token_id'
 отсортированным списком имён.
 
 ```python
-InvalidToken("abc", "admin")          # TypeError
+InvalidToken("abc", "admin")  # TypeError
 InvalidToken(token_id="a", scope="b", extra=1)  # TypeError
 ```
 
@@ -167,7 +168,7 @@ InvalidToken(token_id="a", scope="b", extra=1)  # TypeError
 ```python
 from typing import ClassVar
 
-from typed_exceptions.exception import TypedException
+from typed_exceptions import TypedException
 
 
 class WithClassVar(TypedException):
@@ -184,7 +185,7 @@ print(WithClassVar().context)  # {'detail': 'x'}
 ```python
 from typing import ClassVar
 
-from typed_exceptions.exception import TypedException
+from typed_exceptions import TypedException
 
 
 class WithConstant(TypedException):
@@ -193,8 +194,8 @@ class WithConstant(TypedException):
 
 
 error = WithConstant()
-print(error.internal)   # 0
-print(error.context)    # {'visible': 1}
+print(error.internal)  # 0
+print(error.context)  # {'visible': 1}
 ```
 
 `ClassVar[T]` также может удалить поле, унаследованное от базового класса. Его
@@ -245,7 +246,7 @@ UserNotFound(user_id="42")  # runtime: accepted; type checker: error
 ```python
 import dataclasses
 
-from typed_exceptions.exception import TypedException, field
+from typed_exceptions import TypedException, field
 
 
 class ConfigWarning(TypedException):
@@ -282,12 +283,8 @@ class Example(TypedException):
     message_template = "value={value}"
     value: str = dataclasses.field(default="x")
     tags: list[str] = dataclasses.field(default_factory=list)
-    secret: str = dataclasses.field(
-        default="", metadata={"redact": True}
-    )
-    internal: int = dataclasses.field(
-        default=0, metadata={"reserved": True}
-    )
+    secret: str = dataclasses.field(default="", metadata={"redact": True})
+    internal: int = dataclasses.field(default=0, metadata={"reserved": True})
 ```
 
 Поддерживаемые параметры `dataclasses.field`:
@@ -333,7 +330,12 @@ print(str(InvalidToken(token_id="abc", scope="admin")))
 # Token abc is invalid for admin
 ```
 
-Значения заполнителей отрисовываются через `str()`, а не через `repr()`.
+Значения заполнителей отрисовываются через `str()`, а не через `repr()`. Если `__str__` значения
+выбрасывает исключение, заполнитель выводится как
+`<unprintable TypeName object>`, чтобы исходная ошибка не подменялась чужой.
+
+Шаблон объявляется обычным атрибутом класса. Даже с аннотацией
+(`message_template: str = "..."`) он остаётся шаблоном и не становится полем.
 
 Поддерживаются только простые заполнители. Следующие варианты отклоняются с
 `ValueError` во время определения класса:
@@ -373,6 +375,8 @@ print(Static.__static_message__)  # always the same
 class Leaky(TypedException):
     message_template = "{secret}"
     secret: str = field(default="", redact=True)
+
+
 # ValueError: redacted field 'secret' cannot appear in message_template
 ```
 
@@ -394,7 +398,7 @@ print(str(error))  # Cache {layer} unavailable
 Передача `MISSING` вместо этого отрисовывает шаблон:
 
 ```python
-from typed_exceptions.exception import MISSING
+from typed_exceptions import MISSING
 
 error = LayerFailure(layer="db", message=MISSING)
 print(str(error))  # Failure in db
@@ -407,6 +411,32 @@ LayerFailure(layer="db", message=1)
 # TypeError: LayerFailure(): message must be str | MISSING
 ```
 
+Чтобы отрисовать другой *шаблон* для одного экземпляра, передайте
+`message_template=`. В отличие от буквального `message=`, он форматируется
+полями экземпляра:
+
+```python
+error = LayerFailure(
+    layer="cache", message_template="Cache {layer} unavailable"
+)
+print(str(error))  # Cache cache unavailable
+print(str(LayerFailure(layer="db")))  # Failure in db
+```
+
+Шаблон экземпляра подчиняется тем же правилам, что и шаблон класса: допустимы
+только простые заполнители `{field_name}`, `{{` и `}}` дают литеральные
+скобки, а неизвестный, неподдерживаемый или скрытый заполнитель вызывает
+`ValueError` (с префиксом `LayerFailure.message_template`). Замечания:
+
+- `message=` и `message_template=` нельзя сочетать (`TypeError`);
+  `MISSING` в обоих случаях означает «не передано».
+- Атрибут класса не меняется, а `message_template` никогда не становится полем
+  и не попадает в `context`.
+- Как и любое шаблонное сообщение, оно перерисовывается при присваивании
+  используемого в нём поля.
+- Скомпилированные шаблоны экземпляров кэшируются по классу и строке шаблона.
+- Для type checker'ов `message_template` — необязательный аргумент `str`.
+
 После конструирования присваивание строки в `message` обновляет `args`, а
 присваивание кортежа из одной строки в `args` обновляет `message`:
 
@@ -414,7 +444,7 @@ LayerFailure(layer="db", message=1)
 error = LayerFailure(layer="db")
 
 error.message = "changed"
-print(error.args)     # ('changed',)
+print(error.args)  # ('changed',)
 
 error.args = ("other",)
 print(error.message)  # other
@@ -423,9 +453,9 @@ print(error.message)  # other
 Другие присваивания отклоняются:
 
 ```python
-error.message = None      # TypeError
-error.args = ("a", "b")   # TypeError
-del error.message         # AttributeError
+error.message = None  # TypeError
+error.args = ("a", "b")  # TypeError
+del error.message  # AttributeError
 ```
 
 ## Структурированный контекст
@@ -440,8 +470,8 @@ class GrandChild(Child):
 
 
 error = GrandChild(a=1)
-print(error.context)          # {'a': 1, 'b': 'b', 'c': 1.5}
-print(list(error.context))    # ['a', 'b', 'c']
+print(error.context)  # {'a': 1, 'b': 'b', 'c': 1.5}
+print(list(error.context))  # ['a', 'b', 'c']
 ```
 
 Значения в `context` — это актуальные значения полей, а не копии. Изменяемые
@@ -460,7 +490,7 @@ print(error.context["tags"])  # ['deprecated']
 ```python
 import dataclasses
 
-from typed_exceptions.exception import TypedException, Redact, field
+from typed_exceptions import TypedException, Redact, field
 
 
 class SecretAccess(TypedException):
@@ -478,9 +508,7 @@ class SecretAccessWithAnnotation(TypedException):
 class SecretAccessWithMetadata(TypedException):
     message_template = "Access denied for {user}"
     user: str
-    api_key: str = dataclasses.field(
-        default="", metadata={"redact": True}
-    )
+    api_key: str = dataclasses.field(default="", metadata={"redact": True})
 
 
 class SecretAccessWithDunder(TypedException):
@@ -494,18 +522,28 @@ class SecretAccessWithDunder(TypedException):
 
 ```python
 error = SecretAccess(user="alice", api_key="super-secret")
-print(error.context)   # {'user': 'alice'}
-print(error.api_key)   # super-secret
+print(error.context)  # {'user': 'alice'}
+print(error.api_key)  # super-secret
 ```
 
-`Redact[T]` также работает внутри `Annotated[...]`, через вложенные псевдонимы
-типов PEP 695 и в строковых аннотациях, включая модули, использующие
-`from __future__ import annotations`.
+`Redact[T]` обнаруживается в любом месте аннотации, поэтому он работает и:
+
+- внутри `Annotated[...]` и вложенных псевдонимов типов PEP 695;
+- в объединениях и необязательных типах: `Redact[str] | None`,
+  `Optional[Redact[str]]`;
+- в аргументах обобщённых типов: `list[Redact[str]]`,
+  `dict[str, Redact[str]]`;
+- в строковых аннотациях, включая модули с `from __future__ import
+  annotations`, и когда часть аннотации называет то, что определено в модуле
+  позже.
+
+Маркер в любом месте скрывает **всё** поле целиком, потому что поле нельзя
+скрыть частично. Аргументы `Literal[...]` никогда не считаются маркерами.
 
 Имена маркеров в аннотациях должны разрешаться из пространства имён класса или
 модуля. При `from __future__ import annotations` псевдоним, импортированный в
 локальной области (например,
-`from typed_exceptions.exception import Redact as R` внутри функции), не может
+`from typed_exceptions import Redact as R` внутри функции), не может
 быть восстановлен, и маркер не обнаруживается. Для конфиденциальных полей
 используйте `field(redact=True)`: он не зависит от разрешения аннотаций.
 
@@ -516,6 +554,7 @@ print(error.api_key)   # super-secret
 - Скрытые имена не могут появляться в `message_template`.
 - `__redact__` должен быть `set` или `frozenset` строк.
 - `__redact__` не может называть неизвестные поля.
+- `__redact__` не может содержать `"message"`.
 - Скрытие влияет только на `context`. Оно **не** фильтрует явные
   переопределения `message`, заметки исключений, вложенные значения или данные
   pickle.
@@ -534,17 +573,15 @@ class WithReserved(TypedException):
 
 
 error = WithReserved(internal=5, public=6)
-print(str(error))       # internal=5 public=6
-print(error.internal)   # 5
-print(error.context)    # {'public': 6}
+print(str(error))  # internal=5 public=6
+print(error.internal)  # 5
+print(error.context)  # {'public': 6}
 ```
 
 Тот же флаг доступен через метаданные dataclass:
 
 ```python
-internal: int = dataclasses.field(
-    default=0, metadata={"reserved": True}
-)
+internal: int = dataclasses.field(default=0, metadata={"reserved": True})
 ```
 
 Следующие имена полей зарезервированы и не могут быть объявлены:
@@ -562,6 +599,8 @@ internal: int = dataclasses.field(
 ```python
 class Bad(TypedException):
     message = "nope"
+
+
 # TypeError: Bad: use message_template = ... instead of message = ...
 ```
 
@@ -572,7 +611,7 @@ class Bad(TypedException):
 или превращать его в `ClassVar`, чтобы удалить.
 
 ```python
-from typed_exceptions.exception import TypedException, field
+from typed_exceptions import TypedException, field
 
 
 class Base(TypedException):
@@ -591,9 +630,9 @@ class GrandChild(Child):
 
 
 error = GrandChild(a=1)
-print(str(error))       # grand 1 b 1.5
-print(error.context)    # {'a': 1, 'b': 'b', 'c': 1.5}
-print(error.secret)     # ""
+print(str(error))  # grand 1 b 1.5
+print(error.context)  # {'a': 1, 'b': 'b', 'c': 1.5}
+print(error.secret)  # ""
 ```
 
 - `Child` наследует шаблон `Base`.
@@ -637,6 +676,26 @@ error.user_id = 2
 print(error.context)  # {'user_id': 2}
 ```
 
+Сообщение, отрисованное из шаблона, следует за используемыми полями.
+Присваивание поля, которое входит в шаблон, перерисовывает сообщение и
+сохраняет `message` и `args` синхронизированными:
+
+```python
+print(str(error))  # User 2 was not found
+print(error.args)  # ('User 2 was not found',)
+```
+
+Сообщение **не** перерисовывается, если:
+
+- `message=` был передан в конструктор (это буквальное сообщение);
+- `message` или `args` присваивали явно (с этого момента сообщение буквальное);
+- значение изменили на месте, например `error.tags.append("x")`, потому что
+  это невозможно обнаружить;
+- присвоенное поле не входит в шаблон.
+
+Шаблон экземпляра, переданный как `message_template=`, перерисовывается так же.
+Исключения, чей шаблон не содержит заполнителей, не несут лишнего состояния.
+
 ### `message` и `args` синхронизированы
 
 `message` всегда является обычной строкой `str`; `args` всегда является
@@ -647,10 +706,15 @@ print(error.context)  # {'user_id': 2}
 пользовательский `__str__` не может расходиться с сохранённым текстом
 сообщения.
 
+Присваивание `message` (или `args`) превращает сообщение в буквальное: дальнейшие
+присваивания полей его больше не меняют.
+
 ### Скомпилированные метаданные класса неизменяемы
 
-Метаданные, скомпилированные при определении класса, замораживаются в классе,
-который их объявляет:
+Метаданные, скомпилированные при определении класса, замораживаются.
+`message_template` защищён в каждом подклассе, в том числе в тех, что только
+наследуют его, потому что поздняя замена молча не повлияла бы на уже
+скомпилированное сообщение:
 
 ```python
 UserNotFound.message_template = "changed"
@@ -672,6 +736,26 @@ fields["x"] = fields["user_id"]  # TypeError
 Объекты `Field` — неизменяемые value-объекты. Присваивание им вызывает
 `FrozenAttributeError`, подкласс `AttributeError`.
 
+Защита класса реализована метаклассом. Сочетание `TypedException` с другим
+метаклассом (`abc.ABC`, `typing.Protocol` и т. д.) вызывает `TypeError:
+metaclass conflict`. `ABC` всё равно не заставит соблюдать абстрактные методы у
+исключения, поэтому «не создавать эту базу напрямую» лучше выражать
+соглашением. Если второй метакласс действительно нужен, объедините их сами:
+
+```python
+from abc import ABCMeta
+
+from typed_exceptions.exception import FrozenClassAttrsMeta
+
+
+class Meta(FrozenClassAttrsMeta, ABCMeta):
+    pass
+
+
+class Base(TypedException, metaclass=Meta):
+    message_template = "base"
+```
+
 Изменение объявлений класса после его создания не поддерживается. Поля и
 шаблоны компилируются при определении подкласса.
 
@@ -692,8 +776,8 @@ fields["x"] = fields["user_id"]  # TypeError
 Пример:
 
 ```python
-print(list(UserNotFound.__fields__))          # ['message', 'user_id']
-print(UserNotFound.__field_names__)           # frozenset({'message', 'user_id'})
+print(list(UserNotFound.__fields__))  # ['message', 'user_id']
+print(UserNotFound.__field_names__)  # frozenset({'message', 'user_id'})
 print([f.name for f in UserNotFound.__required__])  # ['user_id']
 print([f.name for f in UserNotFound.__context_fields__])  # ['user_id']
 ```
@@ -711,11 +795,11 @@ error.add_note("extra context")
 
 restored = pickle.loads(pickle.dumps(error))
 print(type(restored) is GrandChild)  # True
-print(restored.context)              # {'a': 1, 'b': 'b', 'c': 1.5}
-print(restored.__notes__)            # ['extra context']
+print(restored.context)  # {'a': 1, 'b': 'b', 'c': 1.5}
+print(restored.__notes__)  # ['extra context']
 
 clone = copy.deepcopy(error)
-print(clone.context)                 # {'a': 1, 'b': 'b', 'c': 1.5}
+print(clone.context)  # {'a': 1, 'b': 'b', 'c': 1.5}
 ```
 
 Глубокое копирование сохраняет циклические ссылки. Реализация pickle обходит
@@ -739,6 +823,8 @@ pickle в кортеже `args` по-прежнему принимается.
 - объявленные поля становятся именованными параметрами конструктора;
 - `message` необязательная строка при конструировании;
 - `message` является строкой после конструирования;
+- `message_template` необязательная строка при конструировании (шаблон
+  экземпляра, см. [Переопределение сообщения](#переопределение-сообщения));
 - объявления `field()` и `dataclasses.field()` имеют аннотированный тип;
 - методы равенства и упорядочивания dataclass не генерируются.
 
@@ -748,6 +834,30 @@ mypy или pyright, чтобы поймать несоответствующи�
 ```python
 error = UserNotFound(user_id="42")  # static type error
 ```
+
+### Как объявлять шаблоны для анализаторов типов
+
+Объявляйте `message_template` в подклассе **без аннотации**, как во всех
+примерах этого документа. Поскольку для анализаторов типов `message_template`
+ещё и аргумент конструктора, mypy отвергает аннотированные формы:
+
+```python
+class Bad(TypedException):
+    message_template: ClassVar[str] = "..."  # mypy: Cannot override instance
+    #                                          variable with class variable
+    message_template: Final = "..."  # mypy: Cannot override writable
+    #                                          attribute with a final one
+```
+
+Обе формы работают во время выполнения; возражает только статическая проверка.
+Обычное `message_template = "..."` принимается и сохраняет тип `str`.
+
+### `MISSING` — удобство времени выполнения
+
+Для анализаторов типов `message` и `message_template` имеют тип `str`, поэтому
+`message=MISSING` (описан выше) mypy сообщает как ошибку типа аргумента, хотя
+во время выполнения это работает. Лучше опустить аргумент либо отключить
+проверку там, где вы намеренно пробрасываете необязательное значение.
 
 Сам проект проверяется через mypy с довольно строгими настройками, включая
 `disallow_untyped_defs` и `disallow_any_generics`.
@@ -761,6 +871,8 @@ error = UserNotFound(user_id="42")  # static type error
 - Подкласс `Exception`.
 - Конструктор только по именам для объявленных полей.
 - Необязательный аргумент `message` для буквального переопределения.
+- Необязательный аргумент `message_template` для шаблона экземпляра (нельзя
+  сочетать с `message`).
 - Свойство `context`, возвращающее незарезервированные и нескрытые поля.
 - Скомпилированные метаданные и замороженные атрибуты класса.
 - Поддержка pickle, копирования, глубокого копирования и заметок.
@@ -805,7 +917,7 @@ field(
 умолчанию. Передайте `message=MISSING`, чтобы явно отрисовать шаблон.
 
 ```python
-from typed_exceptions.exception import MISSING
+from typed_exceptions import MISSING
 ```
 
 ### `Redact`
@@ -825,9 +937,11 @@ from typed_exceptions.exception import MISSING
 | Удаление `message` | `AttributeError` |
 | Нехешируемое значение по умолчанию | `ValueError` |
 | Одновременно `default` и `factory` | `ValueError` |
-| Некорректный заполнитель шаблона | `ValueError` |
+| Не-строковый аргумент `message_template=` | `TypeError` |
+| Одновременно `message=` и `message_template=` | `TypeError` |
+| Некорректный заполнитель шаблона (класса или экземпляра) | `ValueError` |
 | Скрытый заполнитель в шаблоне | `ValueError` |
-| Некорректный тип `__redact__` или неизвестное имя | `TypeError` |
+| Некорректный тип `__redact__`, неизвестное имя или `"message"` | `TypeError` |
 | Зарезервированное имя поля | `TypeError` |
 | `message = ...` в теле класса | `TypeError` |
 | `message_template` не строка | `TypeError` |
@@ -855,6 +969,8 @@ from typed_exceptions.exception import MISSING
   работает, только когда имя видно в пространстве имён класса или модуля.
   Локальные псевдонимы при `from __future__ import annotations` не
   обнаруживаются; для конфиденциальных полей используйте `field(redact=True)`.
+- **Перерисовка срабатывает только на присваивания.** Переприсваивание поля
+  шаблона обновляет сообщение, а изменение значения на месте — нет.
 - **Произвольные атрибуты экземпляра разрешены.** Присваивание неизвестного
   имени создаёт обычный атрибут экземпляра; опечатки не обнаруживаются.
 - **Нет семантики dataclass.** `eq`, упорядочивание и другие генерируемые
@@ -929,16 +1045,15 @@ uv build
 typed_exceptions/
 ├── src/
 │   └── typed_exceptions/
-│       ├── __init__.py           # no exports; use the exception subpackage
-│       └── exception/
-│           ├── __init__.py       # public API: TypedException, field, Field,
-│           │                     # MISSING, Redact
-│           ├── exception.py      # runtime, metaclass, class construction
-│           ├── field.py          # Field specifications, field(), dataclass interop
-│           ├── template.py       # template compilation and rendering
-│           ├── introspection.py  # PEP 649 annotation helpers
-│           ├── access.py         # frozen value objects, Redact marker
-│           └── sentinel.py       # MISSING sentinel
+│       ├── __init__.py           # public API: TypedException, field, Field,
+│       │                         # MISSING, Redact
+│       ├── exception.py          # runtime, metaclass, class construction
+│       ├── field.py              # Field specifications, field(), dataclass interop
+│       ├── template.py           # template compilation and rendering
+│       ├── introspection.py      # PEP 649 annotation helpers
+│       ├── access.py             # frozen value objects, Redact marker
+│       ├── sentinel.py           # MISSING sentinel
+│       └── py.typed
 ├── tests/
 │   └── test_exception.py
 ├── LICENSE

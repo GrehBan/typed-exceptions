@@ -3,10 +3,18 @@
 import dataclasses
 from collections.abc import Mapping
 from types import MappingProxyType, MemberDescriptorType
-from typing import Any, Final, Protocol, TypeIs, overload, runtime_checkable
+from typing import (
+    Any,
+    Final,
+    Protocol,
+    TypeIs,
+    cast,
+    overload,
+    runtime_checkable,
+)
 
-from typed_exceptions.exception.access import frozen
-from typed_exceptions.exception.sentinel import MISSING
+from typed_exceptions.access import frozen
+from typed_exceptions.sentinel import MISSING
 
 DEFAULT_REDACT: Final[bool] = False
 DEFAULT_RESERVED: Final[bool] = False
@@ -57,7 +65,7 @@ def field_spec(owner: type, name: str) -> Field[Any]:
         name=name,
     )
 
-    if spec.default is not MISSING and type(spec.default).__hash__ is None:
+    if spec.default is not MISSING and not _is_hashable(spec.default):
         raise ValueError(
             f"{owner.__name__}.{name}: unhashable default; "
             "use field(default_factory=...)"
@@ -68,6 +76,14 @@ def field_spec(owner: type, name: str) -> Field[Any]:
 def is_dataclass_missing(value: object) -> TypeIs[dataclasses._MISSING_TYPE]:
     """Return whether ``value`` is a dataclass ``MISSING`` sentinel."""
     return isinstance(value, dataclasses._MISSING_TYPE)
+
+
+def _is_hashable(value: object) -> bool:
+    try:
+        hash(value)
+    except TypeError:
+        return False
+    return True
 
 
 @frozen
@@ -126,12 +142,27 @@ class Field[T]:
             The supplied value, the factory result, the default, or
             ``MISSING`` when the field is required.
         """
-        if self.name in namespace:
-            value: T = namespace[self.name]
-            return value
-        if self.factory is MISSING:
+        supplied: object = namespace.get(self.name, MISSING)
+        if supplied is not MISSING:
+            return cast(T, supplied)
+        factory = self.factory
+        if factory is MISSING:
             return self.default
-        return self.factory()
+        return factory()
+
+    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
+        """Rebuild the field through its constructor.
+
+        The default slot-based reduction assigns attributes, which the frozen
+        field rejects, so copying and pickling would fail.
+        """
+        return type(self), (
+            self.default,
+            self.factory,
+            self.redact,
+            self.reserved,
+            self.name,
+        )
 
     def __repr__(self) -> str:
         """Return a debug representation of the field."""

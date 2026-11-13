@@ -58,7 +58,8 @@ typo, and awkward to consume programmatically.
 - Required fields, defaults, and default factories
 - Compatibility with `dataclasses.field`
 - Message templates with simple `{field_name}` placeholders
-- Literal message overrides
+- Literal message overrides and per-instance template overrides
+- Messages that follow the fields they use when those are reassigned
 - Structured `context` mapping in declaration order
 - Redaction via `field(redact=True)`, dataclass metadata, `Redact[T]`, or
   `__redact__`
@@ -99,7 +100,7 @@ pip install .
 ## Quick start
 
 ```python
-from typed_exceptions.exception import TypedException
+from typed_exceptions import TypedException
 
 
 class UserNotFound(TypedException):
@@ -109,11 +110,11 @@ class UserNotFound(TypedException):
 
 error = UserNotFound(user_id=42)
 
-print(str(error))        # User 42 was not found
-print(error.message)     # User 42 was not found
-print(error.args)        # ('User 42 was not found',)
-print(error.context)     # {'user_id': 42}
-print(error.user_id)     # 42
+print(str(error))  # User 42 was not found
+print(error.message)  # User 42 was not found
+print(error.args)  # ('User 42 was not found',)
+print(error.context)  # {'user_id': 42}
+print(error.user_id)  # 42
 ```
 
 `TypedException` is a regular `Exception` subclass, so it can be raised and
@@ -132,7 +133,7 @@ Subclass `TypedException` and declare fields as annotated attributes. Use
 `message_template` to define how the message is rendered.
 
 ```python
-from typed_exceptions.exception import TypedException
+from typed_exceptions import TypedException
 
 
 class InvalidToken(TypedException):
@@ -146,14 +147,14 @@ optional.
 
 ```python
 InvalidToken(token_id="abc", scope="admin")  # OK
-InvalidToken(scope="admin")                  # TypeError: missing 'token_id'
+InvalidToken(scope="admin")  # TypeError: missing 'token_id'
 ```
 
 The constructor is keyword-only. Positional arguments are rejected, and unknown
 keyword arguments raise `TypeError` with a sorted list of names.
 
 ```python
-InvalidToken("abc", "admin")          # TypeError
+InvalidToken("abc", "admin")  # TypeError
 InvalidToken(token_id="a", scope="b", extra=1)  # TypeError
 ```
 
@@ -162,7 +163,7 @@ InvalidToken(token_id="a", scope="b", extra=1)  # TypeError
 ```python
 from typing import ClassVar
 
-from typed_exceptions.exception import TypedException
+from typed_exceptions import TypedException
 
 
 class WithClassVar(TypedException):
@@ -179,7 +180,7 @@ keeping the attribute accessible:
 ```python
 from typing import ClassVar
 
-from typed_exceptions.exception import TypedException
+from typed_exceptions import TypedException
 
 
 class WithConstant(TypedException):
@@ -188,8 +189,8 @@ class WithConstant(TypedException):
 
 
 error = WithConstant()
-print(error.internal)   # 0
-print(error.context)    # {'visible': 1}
+print(error.internal)  # 0
+print(error.context)  # {'visible': 1}
 ```
 
 `ClassVar[T]` can also remove a field inherited from a base class. It is
@@ -238,7 +239,7 @@ values so each exception instance gets a fresh object.
 ```python
 import dataclasses
 
-from typed_exceptions.exception import TypedException, field
+from typed_exceptions import TypedException, field
 
 
 class ConfigWarning(TypedException):
@@ -275,12 +276,8 @@ class Example(TypedException):
     message_template = "value={value}"
     value: str = dataclasses.field(default="x")
     tags: list[str] = dataclasses.field(default_factory=list)
-    secret: str = dataclasses.field(
-        default="", metadata={"redact": True}
-    )
-    internal: int = dataclasses.field(
-        default=0, metadata={"reserved": True}
-    )
+    secret: str = dataclasses.field(default="", metadata={"redact": True})
+    internal: int = dataclasses.field(default=0, metadata={"reserved": True})
 ```
 
 Supported `dataclasses.field` options:
@@ -326,7 +323,13 @@ print(str(InvalidToken(token_id="abc", scope="admin")))
 # Token abc is invalid for admin
 ```
 
-Placeholder values are rendered with `str()`, not `repr()`.
+Placeholder values are rendered with `str()`, not `repr()`. If a value's
+`__str__` raises, the placeholder renders as `<unprintable TypeName object>`
+so the original error is not replaced by an unrelated one.
+
+The template is declared as a plain class attribute. Even if it is annotated
+(`message_template: str = "..."`), it is treated as the template and never
+becomes a field.
 
 Only simple placeholders are supported. The following are rejected with
 `ValueError` at class definition time:
@@ -366,6 +369,8 @@ redacted fields:
 class Leaky(TypedException):
     message_template = "{secret}"
     secret: str = field(default="", redact=True)
+
+
 # ValueError: redacted field 'secret' cannot appear in message_template
 ```
 
@@ -387,7 +392,7 @@ print(str(error))  # Cache {layer} unavailable
 Passing `MISSING` renders the template instead:
 
 ```python
-from typed_exceptions.exception import MISSING
+from typed_exceptions import MISSING
 
 error = LayerFailure(layer="db", message=MISSING)
 print(str(error))  # Failure in db
@@ -400,6 +405,32 @@ LayerFailure(layer="db", message=1)
 # TypeError: LayerFailure(): message must be str | MISSING
 ```
 
+To render a different *template* for a single instance, pass
+`message_template=`. Unlike a literal `message=`, it is formatted with the
+instance's fields:
+
+```python
+error = LayerFailure(
+    layer="cache", message_template="Cache {layer} unavailable"
+)
+print(str(error))  # Cache cache unavailable
+print(str(LayerFailure(layer="db")))  # Failure in db
+```
+
+An instance template follows the same rules as the class template: only
+simple `{field_name}` placeholders are allowed, `{{` and `}}` produce literal
+braces, and an unknown, unsupported, or redacted placeholder raises
+`ValueError` (prefixed with `LayerFailure.message_template`). Notes:
+
+- `message=` and `message_template=` cannot be combined (`TypeError`);
+  `MISSING` counts as "not passed" for both.
+- The class attribute is not changed, and `message_template` never becomes a
+  field or appears in `context`.
+- Like any template message, it is re-rendered when a field it uses is
+  assigned.
+- Compiled instance templates are cached per class and template string.
+- Type checkers see `message_template` as an optional `str` argument.
+
 After construction, assigning a string to `message` updates `args`, and
 assigning a one-string tuple to `args` updates `message`:
 
@@ -407,7 +438,7 @@ assigning a one-string tuple to `args` updates `message`:
 error = LayerFailure(layer="db")
 
 error.message = "changed"
-print(error.args)     # ('changed',)
+print(error.args)  # ('changed',)
 
 error.args = ("other",)
 print(error.message)  # other
@@ -416,9 +447,9 @@ print(error.message)  # other
 Other assignments are rejected:
 
 ```python
-error.message = None      # TypeError
-error.args = ("a", "b")   # TypeError
-del error.message         # AttributeError
+error.message = None  # TypeError
+error.args = ("a", "b")  # TypeError
+del error.message  # AttributeError
 ```
 
 ## Structured context
@@ -433,8 +464,8 @@ class GrandChild(Child):
 
 
 error = GrandChild(a=1)
-print(error.context)          # {'a': 1, 'b': 'b', 'c': 1.5}
-print(list(error.context))    # ['a', 'b', 'c']
+print(error.context)  # {'a': 1, 'b': 'b', 'c': 1.5}
+print(list(error.context))  # ['a', 'b', 'c']
 ```
 
 The values in `context` are the live field values, not copies. Mutable values
@@ -453,7 +484,7 @@ Mark sensitive fields in one of four ways:
 ```python
 import dataclasses
 
-from typed_exceptions.exception import TypedException, Redact, field
+from typed_exceptions import TypedException, Redact, field
 
 
 class SecretAccess(TypedException):
@@ -471,9 +502,7 @@ class SecretAccessWithAnnotation(TypedException):
 class SecretAccessWithMetadata(TypedException):
     message_template = "Access denied for {user}"
     user: str
-    api_key: str = dataclasses.field(
-        default="", metadata={"redact": True}
-    )
+    api_key: str = dataclasses.field(default="", metadata={"redact": True})
 
 
 class SecretAccessWithDunder(TypedException):
@@ -487,17 +516,25 @@ In every case:
 
 ```python
 error = SecretAccess(user="alice", api_key="super-secret")
-print(error.context)   # {'user': 'alice'}
-print(error.api_key)   # super-secret
+print(error.context)  # {'user': 'alice'}
+print(error.api_key)  # super-secret
 ```
 
-`Redact[T]` also works inside `Annotated[...]`, through nested PEP 695 type
-aliases, and in stringized annotations, including modules that use
-`from __future__ import annotations`.
+`Redact[T]` is detected anywhere in the annotation, so it also works:
+
+- inside `Annotated[...]` and nested PEP 695 type aliases;
+- in unions and optionals: `Redact[str] | None`, `Optional[Redact[str]]`;
+- in generic arguments: `list[Redact[str]]`, `dict[str, Redact[str]]`;
+- in stringized annotations, including modules that use
+  `from __future__ import annotations`, and when part of the annotation names
+  something that is defined later in the module.
+
+A marker anywhere hides the **whole** field, because a field cannot be
+redacted partially. `Literal[...]` arguments are never treated as markers.
 
 Annotation markers must resolve by name from the class or module namespace.
 With `from __future__ import annotations`, an alias imported in a local scope
-(for example `from typed_exceptions.exception import Redact as R` inside a
+(for example `from typed_exceptions import Redact as R` inside a
 function) cannot be recovered, and the marker is not detected. Use
 `field(redact=True)` for security-sensitive fields; it does not depend on
 annotation resolution.
@@ -525,17 +562,15 @@ class WithReserved(TypedException):
 
 
 error = WithReserved(internal=5, public=6)
-print(str(error))       # internal=5 public=6
-print(error.internal)   # 5
-print(error.context)    # {'public': 6}
+print(str(error))  # internal=5 public=6
+print(error.internal)  # 5
+print(error.context)  # {'public': 6}
 ```
 
 The same flag is available through dataclass metadata:
 
 ```python
-internal: int = dataclasses.field(
-    default=0, metadata={"reserved": True}
-)
+internal: int = dataclasses.field(default=0, metadata={"reserved": True})
 ```
 
 The following field names are reserved and cannot be declared:
@@ -553,6 +588,8 @@ body; use `message_template` instead:
 ```python
 class Bad(TypedException):
     message = "nope"
+
+
 # TypeError: Bad: use message_template = ... instead of message = ...
 ```
 
@@ -563,7 +600,7 @@ override defaults, make an inherited field required, or turn it into a
 `ClassVar` to remove it.
 
 ```python
-from typed_exceptions.exception import TypedException, field
+from typed_exceptions import TypedException, field
 
 
 class Base(TypedException):
@@ -582,9 +619,9 @@ class GrandChild(Child):
 
 
 error = GrandChild(a=1)
-print(str(error))       # grand 1 b 1.5
-print(error.context)    # {'a': 1, 'b': 'b', 'c': 1.5}
-print(error.secret)     # ""
+print(str(error))  # grand 1 b 1.5
+print(error.context)  # {'a': 1, 'b': 'b', 'c': 1.5}
+print(error.secret)  # ""
 ```
 
 - `Child` inherits the `Base` template.
@@ -628,6 +665,27 @@ error.user_id = 2
 print(error.context)  # {'user_id': 2}
 ```
 
+A message rendered from a template follows the fields it uses. Assigning a
+field that appears in the template re-renders the message and keeps `message`
+and `args` in sync:
+
+```python
+print(str(error))  # User 2 was not found
+print(error.args)  # ('User 2 was not found',)
+```
+
+The message is **not** re-rendered when:
+
+- `message=` was passed to the constructor (it is a literal);
+- `message` or `args` was assigned explicitly (the message is literal from
+  then on);
+- a value is changed in place, for example `error.tags.append("x")`, because
+  that cannot be detected;
+- the assigned field does not appear in the template.
+
+An instance template passed as `message_template=` is re-rendered the same
+way. Exceptions whose template has no placeholders carry no extra state.
+
 ### `message` and `args` stay in sync
 
 `message` is always a plain `str`; `args` is always a one-element tuple
@@ -636,10 +694,14 @@ containing that string. `str(error)` returns the message.
 Assigning a `str` subclass is normalized to a plain `str`, so a custom
 `__str__` cannot disagree with the stored message text.
 
+Assigning `message` (or `args`) turns the message into a literal: later field
+assignments no longer change it.
+
 ### Compiled class metadata is immutable
 
-Metadata compiled at class definition time is frozen on the class that declares
-it:
+Metadata compiled at class definition time is frozen. `message_template` is
+guarded on every subclass, including ones that only inherit it, because
+changing it later would silently have no effect on the compiled message:
 
 ```python
 UserNotFound.message_template = "changed"
@@ -661,6 +723,26 @@ fields["x"] = fields["user_id"]  # TypeError
 `Field` objects are immutable value objects. Assigning to one raises
 `FrozenAttributeError`, a subclass of `AttributeError`.
 
+The class guard is implemented with a metaclass. Combining `TypedException`
+with another metaclass (`abc.ABC`, `typing.Protocol`, ...) raises `TypeError:
+metaclass conflict`. `ABC` would not enforce abstract methods on an exception
+anyway, so express "do not instantiate this base" by convention instead. If
+you really need a second metaclass, combine them yourself:
+
+```python
+from abc import ABCMeta
+
+from typed_exceptions.exception import FrozenClassAttrsMeta
+
+
+class Meta(FrozenClassAttrsMeta, ABCMeta):
+    pass
+
+
+class Base(TypedException, metaclass=Meta):
+    message_template = "base"
+```
+
 Changing class declarations after the class is created is not supported. Fields
 and templates are compiled when the subclass is defined.
 
@@ -681,8 +763,8 @@ Each `TypedException` subclass exposes compiled metadata:
 Example:
 
 ```python
-print(list(UserNotFound.__fields__))          # ['message', 'user_id']
-print(UserNotFound.__field_names__)           # frozenset({'message', 'user_id'})
+print(list(UserNotFound.__fields__))  # ['message', 'user_id']
+print(UserNotFound.__field_names__)  # frozenset({'message', 'user_id'})
 print([f.name for f in UserNotFound.__required__])  # ['user_id']
 print([f.name for f in UserNotFound.__context_fields__])  # ['user_id']
 ```
@@ -700,11 +782,11 @@ error.add_note("extra context")
 
 restored = pickle.loads(pickle.dumps(error))
 print(type(restored) is GrandChild)  # True
-print(restored.context)              # {'a': 1, 'b': 'b', 'c': 1.5}
-print(restored.__notes__)            # ['extra context']
+print(restored.context)  # {'a': 1, 'b': 'b', 'c': 1.5}
+print(restored.__notes__)  # ['extra context']
 
 clone = copy.deepcopy(error)
-print(clone.context)                 # {'a': 1, 'b': 'b', 'c': 1.5}
+print(clone.context)  # {'a': 1, 'b': 'b', 'c': 1.5}
 ```
 
 Deep copy preserves reference cycles. The pickle implementation bypasses the
@@ -728,6 +810,8 @@ This gives type checkers the following view:
 - declared fields become keyword-only constructor parameters;
 - `message` is an optional string at construction;
 - `message` is a string after construction;
+- `message_template` is an optional string at construction (a per-instance
+  template, see [Message overrides](#message-overrides));
 - `field()` and `dataclasses.field()` declarations have the annotated type;
 - no dataclass equality or ordering methods are generated.
 
@@ -737,6 +821,30 @@ catch mismatched values:
 ```python
 error = UserNotFound(user_id="42")  # static type error
 ```
+
+### Declaring templates for type checkers
+
+Declare `message_template` on a subclass **without an annotation**, as every
+example in this document does. Because `message_template` is also a
+constructor argument for type checkers, mypy rejects the annotated forms:
+
+```python
+class Bad(TypedException):
+    message_template: ClassVar[str] = "..."  # mypy: Cannot override instance
+    #                                          variable with class variable
+    message_template: Final = "..."  # mypy: Cannot override writable
+    #                                          attribute with a final one
+```
+
+Both forms still work at runtime; only the static check objects. Plain
+`message_template = "..."` is accepted and keeps the `str` type.
+
+### `MISSING` is a runtime convenience
+
+`message` and `message_template` are typed as `str` for type checkers, so
+`message=MISSING` (documented above) is reported by mypy as an argument type
+error even though it works at runtime. Omit the argument instead, or silence
+the check where you forward an optional value deliberately.
 
 The project itself is checked with mypy using strict-ish settings, including
 `disallow_untyped_defs` and `disallow_any_generics`.
@@ -750,6 +858,8 @@ Base class for all structured exceptions.
 - Subclass of `Exception`.
 - Keyword-only constructor for declared fields.
 - Optional `message` argument for a literal override.
+- Optional `message_template` argument for a per-instance template (not
+  combinable with `message`).
 - `context` property returning non-reserved, non-redacted fields.
 - Compiled metadata and frozen class attributes.
 - Pickle, copy, deep copy, and note support.
@@ -793,7 +903,7 @@ A sentinel used to represent an omitted value or a field without a default.
 Pass `message=MISSING` to render the template explicitly.
 
 ```python
-from typed_exceptions.exception import MISSING
+from typed_exceptions import MISSING
 ```
 
 ### `Redact`
@@ -811,11 +921,13 @@ It is equivalent to `field(redact=True)` and is inherited by subclasses.
 | Non-string `message` override | `TypeError` |
 | Invalid `args` assignment | `TypeError` |
 | Deleting `message` | `AttributeError` |
-| Unhashable default | `ValueError` |
+| Unhashable default (including a tuple holding a list) | `ValueError` |
 | Both `default` and `factory` | `ValueError` |
-| Invalid template placeholder | `ValueError` |
+| Non-string `message_template=` argument | `TypeError` |
+| Both `message=` and `message_template=` | `TypeError` |
+| Invalid template placeholder (class or instance) | `ValueError` |
 | Redacted placeholder in template | `ValueError` |
-| Invalid `__redact__` type or unknown name | `TypeError` |
+| Invalid `__redact__` type, unknown name, or `"message"` | `TypeError` |
 | Reserved field name | `TypeError` |
 | `message = ...` in a class body | `TypeError` |
 | Non-string `message_template` | `TypeError` |
@@ -842,6 +954,9 @@ It is equivalent to `field(redact=True)` and is inherited by subclasses.
   works only when the name is visible in the class or module namespace. Local
   aliases under `from __future__ import annotations` are not detected; use
   `field(redact=True)` for security-sensitive fields.
+- **Re-rendering follows assignments only.** Reassigning a template field
+  updates the message, but in-place mutation of a value does not.
+  Deleting a placeholder field freezes the last rendered message.
 - **Arbitrary instance attributes are allowed.** Assigning an unknown name
   creates a normal instance attribute; typos are not detected.
 - **No dataclass semantics.** `eq`, ordering, and other dataclass-generated
@@ -917,16 +1032,15 @@ Notes:
 typed_exceptions/
 ├── src/
 │   └── typed_exceptions/
-│       ├── __init__.py           # no exports; use the exception subpackage
-│       └── exception/
-│           ├── __init__.py       # public API: TypedException, field, Field,
-│           │                     # MISSING, Redact
-│           ├── exception.py      # runtime, metaclass, class construction
-│           ├── field.py          # Field specifications, field(), dataclass interop
-│           ├── template.py       # template compilation and rendering
-│           ├── introspection.py  # PEP 649 annotation helpers
-│           ├── access.py         # frozen value objects, Redact marker
-│           └── sentinel.py       # MISSING sentinel
+│       ├── __init__.py           # public API: TypedException, field, Field,
+│       │                         # MISSING, Redact
+│       ├── exception.py          # runtime, metaclass, class construction
+│       ├── field.py              # Field specifications, field(), dataclass interop
+│       ├── template.py           # template compilation and rendering
+│       ├── introspection.py      # PEP 649 annotation helpers
+│       ├── access.py             # frozen value objects, Redact marker
+│       ├── sentinel.py           # MISSING sentinel
+│       └── py.typed
 ├── tests/
 │   └── test_exception.py
 ├── LICENSE

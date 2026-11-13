@@ -1,6 +1,6 @@
 [project]
 name = "typed-exceptions"
-version = "0.1.0"
+version = "0.2.1"
 description = "Exceptions with typed, structured context and message templates"
 keywords = [
     "exceptions",
@@ -125,18 +125,18 @@ show_missing = true
 root_packages = ["typed_exceptions"]
 
 [[tool.importlinter.contracts]]
-name = "Exception package layers"
+name = "Package layers"
 type = "layers"
 layers = [
-    "typed_exceptions.exception.exception",
-    "typed_exceptions.exception.template",
-    "typed_exceptions.exception.field",
-    "typed_exceptions.exception.access",
-    "typed_exceptions.exception.introspection",
-    "typed_exceptions.exception.sentinel",
+    "typed_exceptions.exception",
+    "typed_exceptions.template",
+    "typed_exceptions.field",
+    "typed_exceptions.access",
+    "typed_exceptions.introspection",
+    "typed_exceptions.sentinel",
 ]
 ignore_imports = [
-    "typed_exceptions.exception.template -> typed_exceptions.exception.exception",
+    "typed_exceptions.template -> typed_exceptions.exception",
 ]
 
 [tool.mypy]

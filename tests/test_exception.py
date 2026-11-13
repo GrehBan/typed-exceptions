@@ -1,24 +1,29 @@
 """Tests for TypedException fields, templates, and runtime behavior."""
 
+import abc
 import copy
 import dataclasses
 import doctest
 import pickle
+import sys
+import types
 import typing
-from typing import Annotated, Any, ClassVar, cast
+from collections.abc import Callable
+from typing import Annotated, Any, ClassVar, Final, Literal, cast
 
 import pytest
 
-from typed_exceptions.exception import (
+from typed_exceptions import (
     MISSING,
     Field,
     Redact,
     TypedException,
     field,
 )
-from typed_exceptions.exception import exception as exception_module
-from typed_exceptions.exception.access import frozen
-from typed_exceptions.exception.introspection import string_annotation_head
+from typed_exceptions import exception as exception_module
+from typed_exceptions.access import frozen, should_redact
+from typed_exceptions.exception import FrozenClassAttrsMeta
+from typed_exceptions.introspection import string_annotation_head
 
 
 class UserNotFound(TypedException):
@@ -504,6 +509,620 @@ def test_fields_are_mutable() -> None:
     assert error.context == {"user_id": 2}
 
 
+def test_message_is_rerendered_when_a_template_field_changes() -> None:
+    """Verify a template message follows the fields it uses."""
+    error = UserNotFound(user_id=1)
+    error.user_id = 2
+    assert str(error) == "User 2 was not found"
+    assert error.message == "User 2 was not found"
+    assert error.args == ("User 2 was not found",)
+    assert error.context == {"user_id": 2}
+
+
+class Ticket(TypedException):
+    """Exception with a template field and a field outside the template."""
+
+    message_template = "ticket {number}"
+    number: int
+    owner: str = "nobody"
+
+
+def test_rerender_ignores_fields_outside_the_template() -> None:
+    """Verify only placeholder fields trigger a new rendering."""
+    error = Ticket(number=1)
+    error.message = "manual"
+    error.owner = "bob"
+    assert str(error) == "manual"
+    fresh = Ticket(number=1)
+    fresh.owner = "bob"
+    fresh.extra = "x"
+    assert str(fresh) == "ticket 1"
+
+
+def test_literal_message_is_never_rerendered() -> None:
+    """Verify ``message=`` set at construction stays literal."""
+    error = Ticket(number=1, message="custom {number}")
+    error.number = 2
+    assert str(error) == "custom {number}"
+    assert error.context["number"] == 2
+
+
+def test_message_assignment_makes_the_message_literal() -> None:
+    """Verify assigning ``message`` or ``args`` stops following fields."""
+    error = Ticket(number=1)
+    error.message = "manual"
+    error.number = 2
+    assert str(error) == "manual"
+    other = Ticket(number=1)
+    other.args = ("by args",)
+    other.number = 2
+    assert str(other) == "by args"
+    assert "__live_message__" not in vars(other)
+
+
+def test_message_missing_follows_the_template() -> None:
+    """Verify ``message=MISSING`` behaves like an omitted message."""
+    error = Ticket(number=1, message=MISSING)  # type: ignore[arg-type]
+    error.number = 3
+    assert str(error) == "ticket 3"
+
+
+def test_instance_template_is_rerendered_with_its_own_template() -> None:
+    """Verify an instance template keeps following the fields."""
+    error = Ticket(number=1, message_template="#{number} of {owner}")
+    error.number = 2
+    error.owner = "bob"
+    assert str(error) == "#2 of bob"
+    assert Ticket.message_template == "ticket {number}"
+
+
+def test_static_message_keeps_no_extra_instance_state() -> None:
+    """Verify exceptions without placeholders carry no rendering state."""
+
+    class Static(TypedException):
+        message_template = "always"
+        value: int = 0
+
+    error = Static()
+    error.value = 5
+    assert str(error) == "always"
+    assert "__live_message__" not in vars(error)
+    assert "__live_message__" not in vars(Static(message="x"))
+
+
+def test_rerender_uses_the_value_normalized_by_custom_setattr() -> None:
+    """Verify a subclass ``__setattr__`` runs before the re-rendering."""
+
+    class Normalized(TypedException):
+        message_template = "value={value}"
+        value: int
+
+        def __setattr__(self, name: str, value: Any) -> None:
+            if name == "value":
+                value += 1
+            super().__setattr__(name, value)
+
+    error = Normalized(value=1)
+    assert str(error) == "value=2"
+    error.value = 10
+    assert str(error) == "value=11"
+
+
+def test_rerender_survives_pickle_and_copy() -> None:
+    """Verify restored exceptions keep following their fields."""
+    for template in (None, "no. {number}"):
+        error = (
+            Ticket(number=1)
+            if template is None
+            else Ticket(number=1, message_template=template)
+        )
+        expected = "ticket 2" if template is None else "no. 2"
+        for clone in (
+            pickle.loads(pickle.dumps(error)),
+            copy.copy(error),
+            copy.deepcopy(error),
+        ):
+            clone.number = 2
+            assert str(clone) == expected
+            assert clone.args == (expected,)
+            assert str(error) != expected
+
+
+def test_literal_message_stays_literal_after_pickle() -> None:
+    """Verify a literal message does not start following fields."""
+    error = Ticket(number=1, message="fixed")
+    clone = pickle.loads(pickle.dumps(error))
+    clone.number = 5
+    assert str(clone) == "fixed"
+
+
+def test_rerender_tolerates_unprintable_values() -> None:
+    """Verify a failing ``__str__`` on assignment does not raise."""
+
+    class Broken:
+        def __str__(self) -> str:
+            raise RuntimeError("boom")
+
+    error = Ticket(number=1)
+    error.number = Broken()  # type: ignore[assignment]
+    assert str(error) == "ticket <unprintable Broken object>"
+
+
+def test_in_place_mutation_does_not_rerender() -> None:
+    """Pin the documented limit: in-place changes are not detected."""
+
+    class Tagged(TypedException):
+        message_template = "tags={tags}"
+        tags: list[str] = field(factory=list)
+
+    error = Tagged()
+    error.tags.append("x")
+    assert str(error) == "tags=[]"
+    error.tags = ["y"]
+    assert str(error) == "tags=['y']"
+
+
+def test_unprintable_field_value_does_not_replace_the_error() -> None:
+    """Verify a failing ``__str__`` is replaced by a placeholder."""
+
+    class Broken:
+        def __str__(self) -> str:
+            raise RuntimeError("boom")
+
+    class WithObject(TypedException):
+        message_template = "object {obj}"
+        obj: object
+
+    error = WithObject(obj=Broken())
+    assert str(error) == "object <unprintable Broken object>"
+    assert isinstance(error.obj, Broken)
+
+
+def test_annotated_message_template_is_not_a_field() -> None:
+    """Verify ``message_template: str = ...`` stays a template."""
+
+    class Annotated_(TypedException):
+        message_template: str = "item {item_id}"
+        item_id: int
+
+    error = Annotated_(item_id=3)
+    assert str(error) == "item 3"
+    assert error.context == {"item_id": 3}
+    assert "message_template" not in Annotated_.__field_names__
+    other = Annotated_(item_id=3, message_template="other {item_id}")
+    assert str(other) == "other 3"
+
+
+class Layered(TypedException):
+    """Exception used to exercise per-instance templates."""
+
+    message_template = "Failure in {layer}"
+    layer: str
+    secret: Redact[str] = "s"
+
+
+def test_instance_message_template_is_rendered() -> None:
+    """Verify ``message_template=`` renders for a single instance."""
+    error = Layered(layer="cache", message_template="Cache {layer} down")
+    assert str(error) == "Cache cache down"
+    assert error.message == "Cache cache down"
+    assert error.args == ("Cache cache down",)
+    assert error.context == {"layer": "cache"}
+    assert str(Layered(layer="db")) == "Failure in db"
+    assert Layered.message_template == "Failure in {layer}"
+
+
+def test_instance_message_template_supports_escaped_braces() -> None:
+    """Verify doubled braces stay literal in an instance template."""
+    error = Layered(layer="x", message_template="{{raw}} {layer}")
+    assert str(error) == "{raw} x"
+
+
+def test_instance_message_template_missing_is_unset() -> None:
+    """Verify ``MISSING`` falls back to the class template."""
+    error = Layered(
+        layer="db",
+        message_template=MISSING,  # type: ignore[arg-type]
+    )
+    assert str(error) == "Failure in db"
+    error = Layered(
+        layer="db",
+        message=MISSING,  # type: ignore[arg-type]
+        message_template="{layer}!",
+    )
+    assert str(error) == "db!"
+
+
+def test_instance_message_template_conflicts_with_message() -> None:
+    """Verify a literal message and an instance template are exclusive."""
+    with pytest.raises(TypeError, match="either message or message_template"):
+        Layered(layer="a", message="m", message_template="{layer}")
+
+
+def test_instance_message_template_must_be_str() -> None:
+    """Verify a non-string instance template is rejected."""
+    with pytest.raises(TypeError, match="message_template must be str"):
+        Layered(layer="a", message_template=1)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("template", "expected"),
+    [
+        ("{nope}", "unknown placeholder 'nope'"),
+        ("{message}", "unknown placeholder 'message'"),
+        ("{secret}", "redacted field 'secret'"),
+        ("{layer:>5}", "unsupported placeholder"),
+        ("{layer!r}", "unsupported placeholder"),
+        ("{layer.x}", "unsupported placeholder"),
+        ("{}", "unsupported placeholder"),
+    ],
+)
+def test_instance_message_template_is_validated(
+    template: str, expected: str
+) -> None:
+    """Verify instance templates use the same strict placeholder rules."""
+    with pytest.raises(ValueError, match=expected) as info:
+        Layered(layer="a", message_template=template)
+    assert str(info.value).startswith("Layered.message_template: ")
+
+
+def test_instance_message_template_survives_pickle_and_copy() -> None:
+    """Verify the rendered instance message is what gets restored."""
+    error = Layered(layer="q", message_template="Queue {layer} full")
+    for clone in (
+        pickle.loads(pickle.dumps(error)),
+        copy.copy(error),
+        copy.deepcopy(error),
+    ):
+        assert str(clone) == "Queue q full"
+        assert clone.context == {"layer": "q"}
+
+
+def test_instance_message_template_compilation_is_cached() -> None:
+    """Verify equal instance templates are compiled once per class."""
+    first = exception_module._instance_template(Layered, "x {layer}")
+    second = exception_module._instance_template(Layered, "x {layer}")
+    assert first is second
+
+
+def test_instance_message_template_is_not_a_context_field() -> None:
+    """Verify the keyword never becomes a field or leaks into context."""
+    assert "message_template" not in Layered.__field_names__
+    error = Layered(layer="a", message_template="{layer}")
+    assert "message_template" not in error.context
+    assert "message_template" not in vars(error)
+
+
+def test_annotated_template_forms_work_at_runtime() -> None:
+    """Verify ``ClassVar`` and ``Final`` templates still work at runtime.
+
+    mypy rejects both forms (README, "Type checking"). The ignore comments
+    pin that limit: if mypy stops reporting it, ``warn_unused_ignores``
+    flags them and the documentation has to be revisited.
+    """
+
+    class WithClassVar(TypedException):
+        message_template: ClassVar[str] = "classvar {n}"  # type: ignore[misc]
+        n: int
+
+    class WithFinal(TypedException):
+        message_template: Final = "final {n}"  # type: ignore[misc]
+        n: int
+
+    assert str(WithClassVar(n=1)) == "classvar 1"
+    assert str(WithFinal(n=2)) == "final 2"
+    assert WithClassVar.__field_names__ == {"message", "n"}
+    assert WithFinal.__field_names__ == {"message", "n"}
+
+
+def test_unannotated_template_override_is_type_checked_cleanly() -> None:
+    """Verify the documented form passes mypy, kwarg included."""
+
+    class Plain(Layered):
+        message_template = "plain {layer}"
+
+    assert str(Plain(layer="x")) == "plain x"
+    assert str(Plain(layer="x", message_template="own {layer}")) == "own x"
+
+
+def test_template_is_frozen_on_inheriting_subclasses() -> None:
+    """Verify a subclass cannot silently shadow the compiled template."""
+
+    class Parent(TypedException):
+        message_template = "parent"
+
+    class Child(Parent):
+        pass
+
+    with pytest.raises(AttributeError, match="frozen class attribute"):
+        Child.message_template = "changed"
+    with pytest.raises(AttributeError, match="frozen class attribute"):
+        del Child.message_template
+    with pytest.raises(AttributeError, match="frozen class attribute"):
+        Child.message = "changed"
+    assert str(Child()) == "parent"
+    assert Child.message_template == "parent"
+
+
+def test_other_metaclasses_conflict_unless_combined() -> None:
+    """Pin the documented metaclass limit and its workaround."""
+    with pytest.raises(TypeError, match="metaclass conflict"):
+
+        class Plain(TypedException, abc.ABC):  # type: ignore[metaclass]
+            message_template = "x"
+
+    class Meta(FrozenClassAttrsMeta, abc.ABCMeta):
+        pass
+
+    class Combined(TypedException, metaclass=Meta):
+        message_template = "combined {n}"
+        n: int
+
+    assert str(Combined(n=1)) == "combined 1"
+    with pytest.raises(AttributeError, match="frozen class attribute"):
+        Combined.message_template = "changed"
+
+
+_FORMS_SOURCE = """
+from typing import Annotated, Literal, Optional, Union
+
+from typed_exceptions import TypedException, Redact, field
+
+type Secret = Redact[str]
+type Json = dict[str, "Json"] | list["Json"] | Redact[str]
+type Plain = list["Plain"] | int
+
+
+class Forms(TypedException):
+    message_template = "forms"
+    direct: Redact[str] = ""
+    pep604: Redact[str] | None = None
+    reversed_: None | Redact[str] = None
+    optional: Optional[Redact[str]] = None
+    union: Union[int, Redact[str]] = 0
+    inner: Redact[str | None] = None
+    alias: Secret = ""
+    alias_optional: Secret | None = None
+    annotated_union: Annotated[Redact[str], "meta"] | None = None
+    in_list: list[Redact[str]] = field(factory=list)
+    in_dict: dict[str, Redact[str]] = field(factory=dict)
+    in_tuple: tuple[Redact[str], ...] = ()
+    quoted_inner: list["Redact[str]"] = field(factory=list)
+    recursive_json: Json = ""
+    plain: str = ""
+    annotated_plain: Annotated[str, "meta"] | None = None
+    literal: Literal["Redact"] = "Redact"
+    literal_union: Literal["Redact"] | None = None
+    recursive_plain: Plain = 0
+    optional_plain: Optional[int] = None
+"""
+_REDACTED_FORMS = frozenset(
+    {
+        "direct",
+        "pep604",
+        "reversed_",
+        "optional",
+        "union",
+        "inner",
+        "alias",
+        "alias_optional",
+        "annotated_union",
+        "in_list",
+        "in_dict",
+        "in_tuple",
+        "quoted_inner",
+        "recursive_json",
+    }
+)
+_VISIBLE_FORMS = frozenset(
+    {
+        "plain",
+        "annotated_plain",
+        "literal",
+        "literal_union",
+        "recursive_plain",
+        "optional_plain",
+    }
+)
+
+
+def _load_module(
+    monkeypatch: pytest.MonkeyPatch, name: str, source: str
+) -> types.ModuleType:
+    module = types.ModuleType(name)
+    monkeypatch.setitem(sys.modules, name, module)
+    exec(source, module.__dict__)
+    return module
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    ["", "from __future__ import annotations\n"],
+    ids=["eager", "future"],
+)
+def test_redact_is_detected_in_every_annotation_form(
+    prefix: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify Redact hides a field wherever it appears in the annotation.
+
+    Unions, ``Optional``, generic arguments, aliases, and quoted parts must
+    behave the same with and without postponed annotations.
+    """
+    module = _load_module(
+        monkeypatch, f"redact_forms_{len(prefix)}", prefix + _FORMS_SOURCE
+    )
+    forms = module.Forms
+    assert forms.__redact__ == _REDACTED_FORMS
+    assert frozenset(forms().context) == _VISIBLE_FORMS
+
+
+def test_redact_is_detected_through_unresolved_forward_references(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify names that are defined later do not hide the marker.
+
+    PEP 649 replaces the whole annotation with a forward reference, which
+    keeps the parts that did resolve in a separate mapping.
+    """
+    module = _load_module(
+        monkeypatch,
+        "redact_later",
+        """
+from typing import Optional
+
+from typed_exceptions import TypedException, Redact
+
+
+class Holder(TypedException):
+    message_template = "holder"
+    a: Redact[str] | Later = ""
+    b: "Redact[str] | Later" = ""
+    c: "int | Later" = 0
+    d: list[Redact[str] | Later] = None
+    e: Redact[Later] = None
+    f: Later | None = None
+    g: Optional[Redact[Later]] = None
+    h: Later = None
+
+
+class Later:
+    pass
+""",
+    )
+    holder = module.Holder
+    assert holder.__redact__ == {"a", "b", "d", "e", "g"}
+    assert frozenset(holder().context) == {"c", "f", "h"}
+
+
+@pytest.mark.parametrize(
+    ("annotation", "expected"),
+    [
+        (Callable[[Redact[str]], int], True),
+        ("'Redact[str]'", True),
+        ("typed_exceptions.access.Redact[str]", True),
+        ("list[", False),
+        ("a\x00b", False),
+        ("[" * 3000, False),
+        (Literal["Redact"], False),
+        ("Literal['Redact']", False),
+        ("typing.Literal['Redact'] | None", False),
+        ("int | None", False),
+    ],
+)
+def test_should_redact_edge_cases(annotation: object, expected: bool) -> None:
+    """Verify odd, invalid, and look-alike annotations are handled safely."""
+    assert should_redact(annotation, UserNotFound) is expected
+
+
+def test_marker_lookup_does_not_call_equality_of_other_metadata() -> None:
+    """Verify unrelated ``Annotated`` metadata is compared by identity."""
+
+    class Unequal:
+        def __eq__(self, other: object) -> bool:
+            raise RuntimeError("must not be called")
+
+        __hash__ = None  # type: ignore[assignment]
+
+    assert should_redact(Annotated[str, Unequal()], UserNotFound) is False
+
+
+def test_reinitializing_a_live_exception_with_a_literal_message() -> None:
+    """Verify a second ``__init__`` does not keep the old template."""
+    error = Ticket(number=1)
+    error.__init__(number=2, message="literal")  # type: ignore[misc]
+    error.number = 3
+    assert str(error) == "literal"
+    assert "__live_message__" not in vars(error)
+
+
+def test_reinitializing_a_literal_exception_without_a_message() -> None:
+    """Verify a second ``__init__`` can make the message live again."""
+    error = Ticket(number=1, message="literal")
+    error.__init__(number=2)  # type: ignore[misc]
+    error.number = 3
+    assert str(error) == "ticket 3"
+
+
+def test_field_named_self_is_supported() -> None:
+    """Verify ``self`` and ``cls`` are usable as field names."""
+
+    class Odd(TypedException):
+        message_template = "{self}/{cls}"
+        self: int
+        cls: int
+
+    error = Odd(self=1, cls=2)
+    assert str(error) == "1/2"
+    assert error.context == {"self": 1, "cls": 2}
+    assert copy.deepcopy(error).context == {"self": 1, "cls": 2}
+
+
+class Spec(TypedException):
+    """Exception whose compiled metadata is copied in the tests below."""
+
+    message_template = "{a}-tail"
+    a: int
+    b: Redact[str] = field(default="x", reserved=True)
+    c: list[int] = field(factory=list)
+
+
+def _clones(value: Any) -> list[Any]:
+    return [
+        copy.copy(value),
+        copy.deepcopy(value),
+        pickle.loads(pickle.dumps(value)),
+    ]
+
+
+@pytest.mark.parametrize("name", ["a", "b", "c"])
+def test_field_survives_copy_and_pickle(name: str) -> None:
+    """Verify frozen ``Field`` objects can be copied and pickled."""
+    original = Spec.__fields__[name]
+    for clone in _clones(original):
+        assert type(clone) is Field
+        assert clone is not original
+        assert repr(clone) == repr(original)
+        with pytest.raises(AttributeError):
+            clone.name = "changed"
+
+
+def test_template_survives_copy_and_pickle() -> None:
+    """Verify a compiled template and its parts stay functional."""
+    template = Spec.__dynamic_template__
+    for clone in _clones(template):
+        assert clone is not template
+        assert clone.names == template.names == {"a"}
+        assert clone.is_static is template.is_static is False
+        assert clone.build(Spec(a=9)) == "9-tail"
+        assert [(p.literal, p.name) for p in clone.parts] == [
+            (p.literal, p.name) for p in template.parts
+        ]
+        with pytest.raises(AttributeError):
+            clone.parts = ()
+    part = template.parts[0]
+    for part_clone in _clones(part):
+        assert part_clone.literal == part.literal
+        assert part_clone.name == part.name
+
+
+def test_public_api_is_exported_from_package_root() -> None:
+    """Verify the package root re-exports the public API."""
+    import typed_exceptions
+
+    assert typed_exceptions.TypedException is TypedException
+    assert typed_exceptions.Field is Field
+    assert typed_exceptions.Redact is Redact
+    assert typed_exceptions.MISSING is MISSING
+    assert typed_exceptions.field is field
+    assert set(typed_exceptions.__all__) == {
+        "MISSING",
+        "Field",
+        "Redact",
+        "TypedException",
+        "field",
+    }
+
+
 # --- redaction ---
 
 
@@ -716,7 +1335,7 @@ def test_redact_local_alias_with_future_annotations_is_not_detected() -> None:
     namespace: dict[str, Any] = {"TypedException": TypedException}
     exec(
         "from __future__ import annotations\n"
-        "from typed_exceptions.exception import Redact as R\n"
+        "from typed_exceptions import Redact as R\n"
         "class LocalAlias(TypedException):\n"
         "    token: R[str] = ''\n",
         namespace,
@@ -922,3 +1541,65 @@ def test_restore_legacy_state_argument() -> None:
     )
     assert restored.user_id == 5
     assert restored.message == "legacy"
+
+
+def test_missing_marker_counts_as_not_supplied() -> None:
+    """Verify an explicit MISSING never satisfies a required field."""
+
+    class Needs(TypedException):
+        message_template = "{n}"
+        n: int
+        m: int = 1
+
+    with pytest.raises(TypeError, match="missing required"):
+        Needs(n=MISSING)  # type: ignore[arg-type]
+    assert Needs(n=2, m=MISSING).m == 1  # type: ignore[arg-type]
+
+
+def test_default_with_mutable_item_is_rejected() -> None:
+    """Verify hashable containers holding mutable items are rejected."""
+    with pytest.raises(ValueError, match="unhashable default"):
+
+        class Shared(TypedException):
+            message_template = "x"
+            items: tuple[list[int], ...] = ([],)
+
+
+def test_redacting_message_is_rejected() -> None:
+    """Verify __redact__ cannot name the message field."""
+    with pytest.raises(TypeError, match="'message' cannot be listed"):
+
+        class Hidden(TypedException):
+            message_template = "x"
+            __redact__ = frozenset({"message"})
+
+
+def test_instance_template_cache_does_not_keep_classes_alive() -> None:
+    """Verify dynamically created classes are still collected."""
+    import gc
+    import weakref
+
+    class Temp(TypedException):
+        message_template = "{a}"
+        a: int
+
+    Temp(a=1, message_template="t {a}")
+    ref = weakref.ref(Temp)
+    del Temp
+    gc.collect()
+    assert ref() is None
+
+
+def test_deleted_template_field_does_not_break_other_assignments() -> None:
+    """Verify assigning another field after deleting a placeholder works."""
+
+    class Pair(TypedException):
+        message_template = "{a}/{b}"
+        a: int
+        b: int
+
+    error = Pair(a=1, b=2)
+    del error.a
+    error.b = 3
+    assert error.b == 3
+    assert error.message == "1/2"

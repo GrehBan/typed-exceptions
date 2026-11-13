@@ -1,12 +1,13 @@
 """Annotation introspection for Python 3.14 class semantics."""
 
+import ast
 import sys
 from annotationlib import Format, get_annotations
 from ast import literal_eval
 from types import ModuleType
 from typing import Any, ClassVar, get_origin
 
-from typed_exceptions.exception.sentinel import MISSING
+from typed_exceptions.sentinel import MISSING
 
 
 def declared_annotations(cls: type) -> dict[str, Any]:
@@ -85,21 +86,71 @@ def string_annotation_head(annotation: str) -> str | None:
     return head
 
 
-def resolve_string_annotation(annotation: str, owner: type) -> object | None:
-    """Resolve the head of a string annotation in ``owner``'s namespaces.
+def annotation_names(annotation: str, owner: type) -> list[tuple[str, object]]:
+    """Return the dotted names a string annotation refers to.
+
+    The annotation is parsed, never evaluated. Quoted annotations nested in
+    it are parsed too, and ``Literal[...]`` arguments are skipped because
+    they are values, not references.
 
     Args:
-        annotation: String annotation to resolve.
-        owner: Class that declares the annotation.
+        annotation: String annotation to inspect.
+        owner: Class whose class and module namespaces resolve the names.
 
     Returns:
-        The resolved object, or ``None`` when the name cannot be resolved.
+        Pairs of a dotted name and the object found for it in the
+        namespaces, or ``MISSING`` when the name cannot be resolved.
     """
-    head = string_annotation_head(annotation)
-    if head is None:
-        return None
-    value = resolve_qualified_name(head.split("."), owner)
-    return None if value is MISSING else value
+    names: list[tuple[str, object]] = []
+    sources = [annotation]
+    seen: set[str] = set()
+    while sources:
+        source = sources.pop()
+        if source in seen:
+            continue
+        seen.add(source)
+        try:
+            tree = ast.parse(source.strip(), mode="eval")
+        except SyntaxError, ValueError, RecursionError:
+            continue
+        _collect_names(tree.body, owner, names, sources)
+    return names
+
+
+def _collect_names(
+    root: ast.AST,
+    owner: type,
+    names: list[tuple[str, object]],
+    nested_sources: list[str],
+) -> None:
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        dotted = _dotted_name(node)
+        if dotted is not None:
+            parts = dotted.split(".")
+            names.append((dotted, resolve_qualified_name(parts, owner)))
+        elif isinstance(node, ast.Constant):
+            if isinstance(node.value, str):
+                nested_sources.append(node.value)
+        elif isinstance(node, ast.Subscript) and _is_literal(node.value):
+            continue
+        else:
+            stack.extend(ast.iter_child_nodes(node))
+
+
+def _dotted_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        head = _dotted_name(node.value)
+        return None if head is None else f"{head}.{node.attr}"
+    return None
+
+
+def _is_literal(node: ast.AST) -> bool:
+    dotted = _dotted_name(node)
+    return dotted is not None and dotted.rpartition(".")[2] == "Literal"
 
 
 def _unquote(annotation: str) -> str | None:

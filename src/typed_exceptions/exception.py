@@ -1,6 +1,7 @@
 """Core exception runtime and class-construction machinery."""
 
 import dataclasses
+import weakref
 from collections.abc import Callable, Mapping
 from typing import (
     TYPE_CHECKING,
@@ -10,25 +11,29 @@ from typing import (
     dataclass_transform,
 )
 
-from typed_exceptions.exception.access import should_redact
-from typed_exceptions.exception.field import (
+from typed_exceptions.access import should_redact
+from typed_exceptions.field import (
     Field,
     field,
     field_spec,
     fields_proxy,
 )
-from typed_exceptions.exception.introspection import (
+from typed_exceptions.introspection import (
     declared_annotations,
     is_classvar,
 )
-from typed_exceptions.exception.sentinel import MISSING
-from typed_exceptions.exception.template import (
+from typed_exceptions.sentinel import MISSING
+from typed_exceptions.template import (
     TEMPLATE_COMPILER,
     DynamicTemplate,
     DynamicTemplatePart,
 )
 
 MESSAGE = "message"
+MESSAGE_TEMPLATE = "message_template"
+# Instance state of a message that follows its fields: ``True`` for the class
+# template, a string for a per-instance template, absent for a literal one.
+LIVE_MESSAGE = "__live_message__"
 
 type _ExceptionState = (
     dict[str, Any] | tuple[dict[str, Any] | None, dict[str, Any]] | None
@@ -57,13 +62,26 @@ def _restore_exception[E: TypedException](
     return exc
 
 
+def _is_frozen_attr(cls: type, name: str) -> bool:
+    """Return whether ``name`` is frozen metadata of ``cls``.
+
+    Compiled attributes are frozen where they are stored. ``message`` and
+    ``message_template`` are inherited without being stored on each subclass,
+    so they are guarded everywhere: assigning them on a subclass would
+    otherwise be a silent no-op, because the template is already compiled.
+    """
+    if name not in FrozenClassAttrsMeta.__frozen_attrs__:
+        return False
+    return name in vars(cls) or name in _INHERITED_FROZEN_ATTRS
+
+
 class FrozenClassAttrsMeta(type):
     """Metaclass that prevents changes to compiled class metadata."""
 
     __frozen_attrs__ = frozenset(
         {
             MESSAGE,
-            "message_template",
+            MESSAGE_TEMPLATE,
             "__redact__",
             "__fields_set__",
             "__field_names__",
@@ -78,8 +96,8 @@ class FrozenClassAttrsMeta(type):
     )
 
     def __setattr__(cls, name: str, value: Any) -> None:
-        """Reject changes to frozen attributes declared on the class."""
-        if name in type(cls).__frozen_attrs__ and name in vars(cls):
+        """Reject changes to frozen attributes of the class."""
+        if _is_frozen_attr(cls, name):
             raise AttributeError(
                 f"cannot modify frozen class attribute "
                 f"{cls.__qualname__}.{name}"
@@ -88,8 +106,8 @@ class FrozenClassAttrsMeta(type):
         super().__setattr__(name, value)
 
     def __delattr__(cls, name: str) -> None:
-        """Reject deletion of frozen attributes declared on the class."""
-        if name in type(cls).__frozen_attrs__ and name in vars(cls):
+        """Reject deletion of frozen attributes of the class."""
+        if _is_frozen_attr(cls, name):
             raise AttributeError(
                 f"cannot delete frozen class attribute "
                 f"{cls.__qualname__}.{name}"
@@ -97,6 +115,8 @@ class FrozenClassAttrsMeta(type):
 
         super().__delattr__(name)
 
+
+_INHERITED_FROZEN_ATTRS = frozenset({MESSAGE, MESSAGE_TEMPLATE})
 
 _RESERVED_FIELD_NAMES = frozenset(
     {
@@ -158,7 +178,9 @@ def _collect_fields(
     declared_fields: dict[str, Field[Any] | MISSING] = {}
 
     for name, hint in annotations.items():
-        if is_classvar(hint, cls):
+        # ``message_template: str = ...`` without ClassVar is still the
+        # template, never a context field.
+        if name == MESSAGE_TEMPLATE or is_classvar(hint, cls):
             declared_fields[name] = MISSING
             fields.pop(name, None)
             continue
@@ -185,6 +207,11 @@ def _finalize_fields(
     if MESSAGE not in fields:
         raise TypeError(
             f"{cls.__name__}: 'message' must remain an instance field"
+        )
+
+    if MESSAGE in declared_redacted:
+        raise TypeError(
+            f"{cls.__name__}: 'message' cannot be listed in __redact__"
         )
 
     unknown_hidden = {str(hidden) for hidden in declared_redacted}.difference(
@@ -225,15 +252,13 @@ def _finalize_fields(
     )
 
 
-def _compile_message_template(cls: type[TypedException]) -> None:
-    template: Any = cls.message_template
-    if not isinstance(template, str):
-        raise TypeError(f"{cls.__name__}.message_template must be str")
-
+def _build_template(
+    cls: type[TypedException], template: str
+) -> DynamicTemplate:
     # ``message`` is an implicit field but cannot be a template placeholder:
     # it is assigned only after the template is rendered.
     template_fields = cls.__field_names__ - {MESSAGE}
-    cls.__dynamic_template__ = DynamicTemplate(
+    return DynamicTemplate(
         *(
             DynamicTemplatePart(literal, name)
             for literal, name in TEMPLATE_COMPILER.compile(
@@ -244,6 +269,102 @@ def _compile_message_template(cls: type[TypedException]) -> None:
             )
         )
     )
+
+
+_INSTANCE_TEMPLATE_LIMIT = 256
+_INSTANCE_TEMPLATES: weakref.WeakKeyDictionary[
+    type[TypedException], dict[str, DynamicTemplate]
+] = weakref.WeakKeyDictionary()
+
+
+def _instance_template(
+    cls: type[TypedException], template: str
+) -> DynamicTemplate:
+    """Compile a per-instance template once per class and source string.
+
+    The cache is keyed weakly by class, so dynamically created classes are
+    still collected, and each class keeps a bounded number of templates.
+    """
+    cache = _INSTANCE_TEMPLATES.setdefault(cls, {})
+    compiled = cache.get(template)
+    if compiled is None:
+        compiled = _build_template(cls, template)
+        if len(cache) >= _INSTANCE_TEMPLATE_LIMIT:
+            cache.pop(next(iter(cache)))
+        cache[template] = compiled
+    return compiled
+
+
+def _render_message(
+    exc: TypedException, override: object, template_override: object
+) -> tuple[str, bool | str | None]:
+    """Render the message for ``exc`` from the constructor arguments.
+
+    Returns:
+        The message and what it must follow when fields change: ``True``
+        for the class template, the template string for a per-instance
+        template, or ``None`` for a literal or placeholder-free message.
+    """
+    cls = type(exc)
+    cls_name = cls.__name__
+    if override is not MISSING and not isinstance(override, str):
+        raise TypeError(f"{cls_name}(): message must be str | MISSING")
+    if template_override is not MISSING:
+        if override is not MISSING:
+            raise TypeError(
+                f"{cls_name}(): pass either message or message_template, "
+                "not both"
+            )
+        if not isinstance(template_override, str):
+            raise TypeError(
+                f"{cls_name}(): message_template must be str | MISSING"
+            )
+        template = _instance_template(cls, template_override)
+        source = template_override if template.names else None
+        return template.build(exc), source
+    if override is MISSING:
+        static = cls.__static_message__
+        if static is MISSING:
+            return cls.__dynamic_template__.build(exc), True
+        return static, None
+    return str.__str__(override), None
+
+
+def _refresh_message(exc: TypedException, name: str) -> None:
+    """Re-render a live message after the field ``name`` was assigned."""
+    source = exc.__live_message__
+    if source is None:
+        return
+    cls = type(exc)
+    if source is True:
+        template = cls.__dynamic_template__
+    else:
+        template = _instance_template(cls, cast(str, source))
+    if name in template.names:
+        try:
+            text = template.build(exc)
+        except AttributeError:
+            # A placeholder field was deleted; keep the last message
+            # instead of failing an unrelated assignment.
+            return
+        _store_message(exc, text)
+
+
+def _store_message(exc: TypedException, text: str) -> None:
+    """Store ``text`` as ``message`` and ``args`` without side effects."""
+    # Going past TypedException.__setattr__ avoids its literal-message switch
+    # while still honouring any other base class in the MRO.
+    parent = super(TypedException, exc)
+    parent.__setattr__(MESSAGE, text)
+    parent.__setattr__("args", (text,))
+
+
+def _compile_message_template(cls: type[TypedException]) -> None:
+    template: Any = cls.message_template
+    if not isinstance(template, str):
+        raise TypeError(f"{cls.__name__}.message_template must be str")
+
+    cls.__dynamic_template__ = _build_template(cls, template)
     cls.__static_message__ = (
         cls.__dynamic_template__.build(cls)
         if cls.__dynamic_template__.is_static
@@ -259,21 +380,26 @@ def _compile_message_template(cls: type[TypedException]) -> None:
 class ExceptionRuntime(Exception):
     """Runtime that validates keyword-only fields and renders messages."""
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, /, *args: Any, **kwargs: Any) -> None:
         """Initialize the exception from keyword-only field values.
 
         Args:
             *args: Rejected; construction is keyword-only.
-            **kwargs: Field values keyed by field name.
+            **kwargs: Field values keyed by field name, plus the optional
+                ``message`` (literal text) and ``message_template`` (a
+                template used instead of the class one) overrides.
 
         Raises:
             TypeError: If a positional argument is supplied, a required field
-                is missing, an unknown field is supplied, or the message is
-                not a string.
+                is missing, an unknown field is supplied, the message or
+                ``message_template`` is not a string, or both are given.
+            ValueError: If ``message_template`` has an unsupported, unknown,
+                or redacted placeholder.
         """
         self = cast(TypedException, self)
         cls = type(self)
         _reject_positional_args(cls, args)
+        template_override = kwargs.pop(MESSAGE_TEMPLATE, MISSING)
         keys = kwargs.keys()
         cls_name = cls.__name__
 
@@ -286,7 +412,7 @@ class ExceptionRuntime(Exception):
         missing = sorted(
             required.name
             for required in cls.__required__
-            if required.name not in kwargs
+            if kwargs.get(required.name, MISSING) is MISSING
         )
         if missing:
             raise TypeError(
@@ -310,15 +436,13 @@ class ExceptionRuntime(Exception):
 
         message_field = cast(Field[str], cls.__fields__[MESSAGE])
         override = message_field.initialize(kwargs)
-        if override is not MISSING and not isinstance(override, str):
-            raise TypeError(f"{cls_name}(): message must be str | MISSING")
-        if override is MISSING:
-            override = cls.__static_message__
-            if override is MISSING:
-                override = cls.__dynamic_template__.build(self)
-        if type(override) is not str:
-            override = str.__str__(override)
-        store(MESSAGE, override)
+        text, live = _render_message(self, override, template_override)
+        store(MESSAGE, text)
+        if live is not None:
+            object.__setattr__(self, LIVE_MESSAGE, live)
+        else:
+            # Calling __init__ again must not keep following the old template.
+            vars(self).pop(LIVE_MESSAGE, None)
 
         super().__init__(self.message)
 
@@ -328,10 +452,17 @@ class TypedException(ExceptionRuntime, metaclass=FrozenClassAttrsMeta):
 
     Define ``message_template`` on subclasses and annotate context fields.
     ``message=...`` overrides the template literally (it is not formatted).
+    ``message_template=...`` renders a different template for one instance;
+    it is validated like the class template and cannot be combined with
+    ``message=``.
     After construction, assigning a string to ``message`` or a one-string
     tuple to ``args`` updates both attributes. Other assignments, including
     ``message = None``, and deletion of either attribute are rejected.
     Omitting ``message`` (or passing ``MISSING``) renders the template.
+    A rendered message follows its fields: assigning a field used by the
+    template re-renders ``message`` and ``args``. A literal ``message=...``,
+    or an explicit assignment to ``message`` or ``args``, is never replaced,
+    and in-place changes to a value are not detected.
 
     Field names and presence are validated, but field value types are checked
     only by a static type checker. Use ``field(factory=...)`` or
@@ -365,7 +496,9 @@ class TypedException(ExceptionRuntime, metaclass=FrozenClassAttrsMeta):
         # For type checkers ``message`` is an optional str argument; after
         # construction it is always a str (see __setattr__).
         message: str = ""
-        message_template: ClassVar[str]
+        # For type checkers ``message_template`` is also an optional str
+        # constructor argument (a per-instance template).
+        message_template: str = ""
         __redact__: ClassVar[frozenset[str]]
         __fields_set__: ClassVar[frozenset[Field[Any]]]
         __field_names__: ClassVar[frozenset[str]]
@@ -376,6 +509,7 @@ class TypedException(ExceptionRuntime, metaclass=FrozenClassAttrsMeta):
         __initializers__: ClassVar[tuple[Field[Any], ...]]
         __static_message__: ClassVar[str | MISSING]
         __dynamic_template__: ClassVar[DynamicTemplate]
+        __live_message__: ClassVar[bool | str | None]
     else:
         # __set_name__ runs only after the class body, so name it here.
         message = Field(name=MESSAGE, reserved=True)
@@ -390,6 +524,7 @@ class TypedException(ExceptionRuntime, metaclass=FrozenClassAttrsMeta):
         __initializers__ = ()
         __static_message__ = ""
         __dynamic_template__ = DynamicTemplate()
+        __live_message__ = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         """Compile fields and the message template for a new subclass."""
@@ -430,14 +565,15 @@ class TypedException(ExceptionRuntime, metaclass=FrozenClassAttrsMeta):
             value = arguments[0]
         elif name != MESSAGE:
             super().__setattr__(name, value)
+            _refresh_message(self, name)
             return
         if not isinstance(value, str):
             raise TypeError("message must be str after construction")
         # Normalize str subclasses so BaseException.__str__ cannot invoke a
         # custom __str__ that disagrees with the stored message text.
-        text = str.__str__(value)
-        super().__setattr__(MESSAGE, text)
-        super().__setattr__("args", (text,))
+        _store_message(self, str.__str__(value))
+        # An explicit message is literal from now on: stop following fields.
+        vars(self).pop(LIVE_MESSAGE, None)
 
     def __delattr__(self, name: str) -> None:
         """Reject deletion of ``message``."""

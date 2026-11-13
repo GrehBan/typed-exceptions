@@ -1,12 +1,12 @@
 """Compile and render exception message templates."""
 
 import string
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 if TYPE_CHECKING:
-    from typed_exceptions.exception.exception import TypedException
+    from typed_exceptions.exception import TypedException
 
-from typed_exceptions.exception.access import frozen
+from typed_exceptions.access import frozen
 
 
 @frozen
@@ -46,15 +46,31 @@ class DynamicTemplatePart:
         """
         if self.name is None:
             return self.literal
-        return self.literal + str(getattr(owner, self.name))
+        value = getattr(owner, self.name)
+        try:
+            text = str(value)
+        except Exception:
+            # A broken __str__ must not replace the error being raised.
+            text = f"<unprintable {type(value).__name__} object>"
+        return self.literal + text
+
+    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
+        """Rebuild the part through its constructor (see ``Field``)."""
+        return type(self), (self.literal, self.name)
 
 
 @frozen
 class DynamicTemplate:
-    """Immutable sequence of compiled template parts."""
+    """Immutable sequence of compiled template parts.
 
-    __slots__ = ("parts",)
+    Attributes:
+        parts: Compiled template parts in render order.
+        names: Field names used by the placeholders.
+    """
+
+    __slots__ = ("parts", "names")
     parts: tuple[DynamicTemplatePart, ...]
+    names: frozenset[str]
 
     def __init__(self, *parts: DynamicTemplatePart) -> None:
         """Initialize the template from its parts.
@@ -63,11 +79,20 @@ class DynamicTemplate:
             *parts: Compiled template parts in render order.
         """
         object.__setattr__(self, "parts", parts)
+        object.__setattr__(
+            self,
+            "names",
+            frozenset(part.name for part in parts if part.name is not None),
+        )
+
+    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
+        """Rebuild the template through its constructor (see ``Field``)."""
+        return type(self), self.parts
 
     @property
     def is_static(self) -> bool:
         """Return whether the template has no placeholders."""
-        return all(part.name is None for part in self.parts)
+        return not self.names
 
     def build(self, owner: object) -> str:
         """Render the full template using values from ``owner``.
