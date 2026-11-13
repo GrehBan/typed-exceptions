@@ -31,11 +31,13 @@ all green, coverage ~98%.
 
 ```
 src/typed_exceptions/
-  __init__.py              # public API: TypedException, Field, field, Redact, MISSING
+  __init__.py              # public API: TypedException, Field, field, Redact, MISSING,
+                           # snapshot_exception
   exception.py             # FrozenClassAttrsMeta, ExceptionRuntime, TypedException
+  snapshot.py              # ExceptionChain/Snapshot, snapshot_exception
   template.py              # TemplateCompiler, DynamicTemplate(Part)
   field.py                 # Field spec, field(), dataclasses.field interop
-  access.py                # Redact[T], should_redact, @frozen, collect_attributes
+  access.py                # Redact[T], should_redact
   introspection.py         # annotation reading / ClassVar detection
   sentinel.py              # MISSING
   py.typed
@@ -43,8 +45,8 @@ tests/test_exception.py    # all tests, one file
 ```
 
 import-linter enforces this top-down order (a module may import only from
-modules below it): `exception → template → field → access → introspection →
-sentinel`. The only allowed upward edge is `template → exception` under
+modules below it): `exception → snapshot → template → field → access →
+introspection → sentinel`. The only allowed upward edge is `template → exception` under
 `TYPE_CHECKING`. If you add a module, add it to
 `[tool.importlinter.contracts]` in the right layer.
 
@@ -77,11 +79,14 @@ sentinel`. The only allowed upward edge is `template → exception` under
 - **Pickle/copy** go through `__reduce__` → `_restore_exception`, which
   bypasses the keyword-only `__init__` (`cls(*args)` would fail).
   `__setstate__` handles both dict and `(dict, slots)` state.
-- **`Field` and template parts are immutable** via the `@frozen` decorator
-  (`access.py`). They define `__reduce__` through their constructors, because
-  the default slot-based reduction assigns attributes and the frozen guard
-  rejects that (copy/pickle would fail). `ExceptionRuntime.__init__` takes
-  `self` positional-only, so a field may be named `self`. `field_spec` always builds a fresh, name-bound `Field` copy.
+- **`Field` and template parts are immutable** frozen slotted dataclasses
+  (`@dataclasses.dataclass(frozen=True, slots=True)`), so copy/pickle work
+  out of the box and they compare and hash by value. `Field` keeps a
+  hand-written `__repr__` (`name` first) and its declaration order is the
+  positional constructor order. `DynamicTemplate` takes a `parts` tuple and
+  derives `names` in `__post_init__`. `ExceptionRuntime.__init__` takes
+  `self` positional-only, so a field may be named `self`. `field_spec`
+  always builds a fresh, name-bound `Field` copy.
 - Field **value types are not validated at runtime** — only names, presence,
   and `message: str`. That is a design decision; don't add runtime type
   checks without discussing it.
@@ -97,7 +102,7 @@ sentinel`. The only allowed upward edge is `template → exception` under
 - Redaction is inherited and cannot be undone by redeclaring a field; redacted
   fields are excluded from `context` and forbidden in templates.
 - A placeholder whose value's `__str__` raises renders as
-  `<unprintable TypeName object>`; never let that error escape `__init__`.
+  `<unprintable module.TypeName>`; never let that error escape `__init__`.
 - `message_template: str = ...` (annotated, no ClassVar) is still the
   template, not a field.
 - `Cls(..., message_template="...")` renders a per-instance template through
@@ -115,13 +120,21 @@ sentinel`. The only allowed upward edge is `template → exception` under
   (`_refresh_message`). State is one instance attribute, `__live_message__`
   (`True` = class template, `str` = per-instance template, absent =
   literal or placeholder-free), kept as plain data so pickle/copy restore it
-  (`DynamicTemplate` itself cannot be pickled: it is `@frozen` with slots).
+  (the frozen dataclasses `Field` and `DynamicTemplate` pickle fine).
   A literal `message=` or an explicit `message`/`args` assignment drops the
   attribute; in-place mutation of a value is not detected.
 - `message`/`message_template` are guarded by the metaclass on every
   subclass (`_is_frozen_attr`), because assigning them on an inheriting
   subclass would be a silent no-op. The metaclass also means `ABC`/`Protocol`
   mixins raise a metaclass conflict; that is documented, not a bug.
+- Snapshots (`snapshot.py`) are immutable dataclasses. `context` is reduced
+  to JSON types at capture (`_plain`: containers copied, unknown objects
+  `str()`-ed, depth capped), so a snapshot never holds live objects and
+  `to_json` cannot raise. Chains are walked breadth-first with each exception
+  numbered once; `limit` cuts the walk and sets `truncated`. With
+  `capture_locals`, locals named like any redacted field in the chain are
+  hidden and long reprs are clipped; this is a name heuristic, documented as
+  such. `redacted` is sorted and `()` stays distinct from `None` (not typed).
 - Templates accept only `{identifier}` — no format specs, conversions,
   attribute/index access, or positional placeholders.
 - `dataclass_transform(kw_only_default=True, eq_default=False,

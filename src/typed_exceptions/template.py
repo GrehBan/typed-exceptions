@@ -1,15 +1,27 @@
 """Compile and render exception message templates."""
 
+import dataclasses
 import string
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
     from typed_exceptions.exception import TypedException
 
-from typed_exceptions.access import frozen
+
+def _obj_name(obj: object) -> str:
+    tp = type(obj)
+    return f"{tp.__module__}.{tp.__qualname__}"
 
 
-@frozen
+def _safe_str(obj: object) -> str:
+    try:
+        return str(obj)
+    except Exception:
+        name = _obj_name(obj)
+        return f"<unprintable {name}>"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
 class DynamicTemplatePart:
     """One literal or field placeholder in a compiled template.
 
@@ -18,22 +30,8 @@ class DynamicTemplatePart:
         name: Field name to read, or ``None`` for a literal-only part.
     """
 
-    __slots__ = (
-        "literal",
-        "name",
-    )
     literal: str
-    name: str | None
-
-    def __init__(self, literal: str, name: str | None = None) -> None:
-        """Initialize the template part.
-
-        Args:
-            literal: Text emitted before the placeholder value.
-            name: Field name to read, or ``None`` for a literal-only part.
-        """
-        object.__setattr__(self, "literal", literal)
-        object.__setattr__(self, "name", name)
+    name: str | None = None
 
     def build(self, owner: object) -> str:
         """Render this part using values from ``owner``.
@@ -47,47 +45,33 @@ class DynamicTemplatePart:
         if self.name is None:
             return self.literal
         value = getattr(owner, self.name)
-        try:
-            text = str(value)
-        except Exception:
-            # A broken __str__ must not replace the error being raised.
-            text = f"<unprintable {type(value).__name__} object>"
+        text = _safe_str(value)
         return self.literal + text
 
-    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
-        """Rebuild the part through its constructor (see ``Field``)."""
-        return type(self), (self.literal, self.name)
 
-
-@frozen
+@dataclasses.dataclass(frozen=True, slots=True)
 class DynamicTemplate:
     """Immutable sequence of compiled template parts.
 
     Attributes:
         parts: Compiled template parts in render order.
-        names: Field names used by the placeholders.
+        names: Field names used by the placeholders, derived from ``parts``.
     """
 
-    __slots__ = ("parts", "names")
-    parts: tuple[DynamicTemplatePart, ...]
-    names: frozenset[str]
+    parts: tuple[DynamicTemplatePart, ...] = ()
+    names: frozenset[str] = dataclasses.field(
+        init=False, repr=False, compare=False
+    )
 
-    def __init__(self, *parts: DynamicTemplatePart) -> None:
-        """Initialize the template from its parts.
-
-        Args:
-            *parts: Compiled template parts in render order.
-        """
-        object.__setattr__(self, "parts", parts)
+    def __post_init__(self) -> None:
+        """Derive ``names`` from the parts."""
         object.__setattr__(
             self,
             "names",
-            frozenset(part.name for part in parts if part.name is not None),
+            frozenset(
+                part.name for part in self.parts if part.name is not None
+            ),
         )
-
-    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
-        """Rebuild the template through its constructor (see ``Field``)."""
-        return type(self), self.parts
 
     @property
     def is_static(self) -> bool:

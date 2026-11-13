@@ -1,22 +1,15 @@
-"""Field access policy and immutable value-object helpers."""
+"""Field access policy: the ``Redact`` marker and its detection."""
 
-from functools import lru_cache
 from typing import (
     Annotated,
-    Any,
     ForwardRef,
     Literal,
     TypeAliasType,
-    cast,
     get_args,
     get_origin,
 )
 
-from typed_exceptions.introspection import (
-    annotation_names,
-    declared_annotations,
-    is_classvar,
-)
+from typed_exceptions.introspection import annotation_names
 from typed_exceptions.sentinel import MISSING
 
 
@@ -152,69 +145,3 @@ def _type_alias(annotation: object, origin: object) -> TypeAliasType | None:
     if isinstance(origin, TypeAliasType):
         return origin
     return None
-
-
-@lru_cache
-def collect_attributes(cls: type) -> frozenset[str]:
-    """Collect annotated non-``ClassVar`` attributes across the MRO.
-
-    Args:
-        cls: Class whose annotations should be inspected.
-
-    Returns:
-        Attribute names declared on the class and its bases.
-    """
-    attrs: set[str] = set()
-
-    for klass in reversed(cls.__mro__):
-        if klass is object:
-            continue
-
-        for name, annotation in declared_annotations(klass).items():
-            if not is_classvar(annotation, klass):
-                attrs.add(name)
-
-    return frozenset(attrs)
-
-
-class FrozenAttributeError(AttributeError):
-    """Raised when assigning to or deleting a frozen attribute."""
-
-
-def frozen[Cls: type](cls: Cls) -> Cls:
-    """Make annotated attributes immutable on instances and the class.
-
-    Args:
-        cls: Class to freeze.
-
-    Returns:
-        The same class with guarded ``__setattr__`` and ``__delattr__``.
-    """
-    owner: type = cls
-    attrs = collect_attributes(owner)
-
-    def is_locked(self: object, name: str) -> bool:
-        return type(self) is owner or name in attrs
-
-    def __setattr__(self: Any, name: str, value: Any) -> None:
-        if is_locked(self, name):
-            raise FrozenAttributeError(
-                f"cannot assign to field {name!r} of {type(self).__name__}"
-            )
-
-        super(cast(type[Any], owner), self).__setattr__(name, value)
-
-    def __delattr__(self: Any, name: str) -> None:
-        if is_locked(self, name):
-            raise FrozenAttributeError(
-                f"cannot delete field {name!r} of {type(self).__name__}"
-            )
-
-        super(cast(type[Any], owner), self).__delattr__(name)
-
-    for method in (__setattr__, __delattr__):
-        method.__qualname__ = f"{cls.__qualname__}.{method.__name__}"
-        method.__module__ = cls.__module__
-        setattr(cls, method.__name__, method)
-
-    return cls

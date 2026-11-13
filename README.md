@@ -28,6 +28,7 @@ construction, structured context, and readable message templates.
 - [Runtime behavior](#runtime-behavior)
 - [Introspection](#introspection)
 - [Pickling, copying, and notes](#pickling-copying-and-notes)
+- [Snapshots](#snapshots)
 - [Type checking](#type-checking)
 - [API reference](#api-reference)
 - [Error reference](#error-reference)
@@ -67,6 +68,8 @@ typo, and awkward to consume programmatically.
 - Inheritance, field overriding, and inherited templates
 - Immutable compiled class metadata and read-only field specifications
 - Pickle, shallow copy, deep copy, and exception notes
+- Immutable, JSON-ready snapshots of exception chains, with redaction-aware
+  locals
 - Static type checker support via `dataclass_transform`
 - No runtime validation of field value types
 
@@ -324,7 +327,7 @@ print(str(InvalidToken(token_id="abc", scope="admin")))
 ```
 
 Placeholder values are rendered with `str()`, not `repr()`. If a value's
-`__str__` raises, the placeholder renders as `<unprintable TypeName object>`
+`__str__` raises, the placeholder renders as `<unprintable module.TypeName>`
 so the original error is not replaced by an unrelated one.
 
 The template is declared as a plain class attribute. Even if it is annotated
@@ -721,7 +724,7 @@ fields["x"] = fields["user_id"]  # TypeError
 ```
 
 `Field` objects are immutable value objects. Assigning to one raises
-`FrozenAttributeError`, a subclass of `AttributeError`.
+`dataclasses.FrozenInstanceError`, a subclass of `AttributeError`.
 
 The class guard is implemented with a metaclass. Combining `TypedException`
 with another metaclass (`abc.ABC`, `typing.Protocol`, ...) raises `TypeError:
@@ -793,6 +796,96 @@ Deep copy preserves reference cycles. The pickle implementation bypasses the
 keyword-only constructor through `_restore_exception`; legacy pickle state in
 the `args` tuple is still accepted.
 
+## Snapshots
+
+`TypedException.snapshot()` and `snapshot_exception()` capture an exception
+and everything reachable from it (`__cause__`, `__context__` and the members
+of an exception group) as immutable plain data. A snapshot can be logged,
+stored or sent over the wire after the original objects are gone.
+
+```python
+from typed_exceptions import Redact, TypedException, snapshot_exception
+
+
+class DbError(TypedException):
+    message_template = "query failed on {table}"
+    table: str
+    password: Redact[str] = ""
+
+
+def run_query(password: str) -> None:
+    try:
+        raise ConnectionError("refused")
+    except ConnectionError as exc:
+        raise DbError(table="users", password=password) from exc
+
+
+try:
+    run_query("hunter2")
+except DbError as error:
+    chain = error.snapshot(schema_version="1", capture_locals=True)
+    short = snapshot_exception(error, schema_version="1", limit=1)
+
+top, cause = chain.items
+print(top.type, top.message)  # __main__.DbError query failed on users
+print(top.context, top.redacted)  # {'table': 'users'} ('password',)
+print(top.cause_id, cause.type)  # 1 builtins.ConnectionError
+print(cause.context)  # None
+print(top.trace[-1].locals)  # {'password': '<redacted>'}
+print(chain.truncated, short.truncated)  # False True
+print(len(short.items), short.items[0].cause_id)  # 1 None
+```
+
+`snapshot_exception(exc, *, schema_version, capture_locals=False, limit=253)`
+works for any exception. `TypedException` instances also have the
+`snapshot()` method, where `schema_version` defaults to `"1"`. Both return an
+`ExceptionChain` (importable from `typed_exceptions.snapshot`) with
+`items`, `schema_version`, `truncated`, `to_dict()` and `to_json()`.
+
+Each item is an `ExceptionSnapshot`:
+
+| Field | Description |
+| --- | --- |
+| `id` | Position in `items`; the captured exception is `0` |
+| `type` | Qualified class name, for example `builtins.KeyError` |
+| `message` | `str()` of the exception, or a placeholder if that fails |
+| `context` | `context` of a `TypedException`, `None` for other exceptions |
+| `redacted` | Sorted redacted field names, `None` for other exceptions |
+| `context_id`, `cause_id` | `id` of `__context__` / `__cause__`, or `None` |
+| `suppress_context` | Value of `__suppress_context__` |
+| `group_ids` | `id` of each captured exception-group member |
+| `trace` | Frames as `FrameSnapshot` (`file_name`, `line_number`, `name`, `line_text`, `locals`) |
+| `notes` | Exception notes as strings |
+
+Exceptions refer to each other by `id`, so a shared or cyclic chain stays
+finite. Items are in breadth-first order, causes before contexts.
+
+`to_dict()` returns `{"root": 0, "exceptions": [...], "schema_version": ...,
+"truncated": ...}`. `schema_version` is only a label you choose; the library
+does not interpret it. `to_json()` never raises on odd values: anything JSON
+cannot encode is written as its `str()`.
+
+### What a snapshot keeps
+
+- **`context` is detached from live objects.** Values are reduced to JSON
+  types when the snapshot is taken: tuples become lists, sets become sorted
+  lists, mapping keys become strings, `NaN` and infinity become strings, and
+  every other object becomes its `str()`. Nesting deeper than
+  `MAX_CONTEXT_DEPTH` (8) is stringified. Changing the exception afterwards
+  does not change the snapshot.
+- **`limit` bounds the work.** At most `limit` exceptions are captured
+  (`MAX_EXCEPTIONS`, 253, by default). If more were reachable, `truncated` is
+  `True` and links to the omitted exceptions are `None`.
+- **Locals are opt-in.** With `capture_locals=True`, each frame records the
+  `repr` of its local variables, clipped to `MAX_LOCAL_LENGTH` (200)
+  characters. Locals named like any redacted field in the chain are replaced
+  by `"<redacted>"`.
+
+Redacted fields stay out of `context`, as everywhere else. Hiding locals is a
+name-based heuristic: a secret copied into a differently named variable is
+captured, and `line_text`, literal message overrides and notes are never
+filtered.
+
 ## Type checking
 
 `TypedException` is decorated with `dataclass_transform`:
@@ -863,6 +956,8 @@ Base class for all structured exceptions.
 - `context` property returning non-reserved, non-redacted fields.
 - Compiled metadata and frozen class attributes.
 - Pickle, copy, deep copy, and note support.
+- `snapshot()` method returning an `ExceptionChain` (see
+  [Snapshots](#snapshots)).
 
 ### `field`
 
@@ -906,10 +1001,45 @@ Pass `message=MISSING` to render the template explicitly.
 from typed_exceptions import MISSING
 ```
 
+
 ### `Redact`
 
 `Redact[T]` is an `Annotated[T, ...]` alias that marks a field for redaction.
 It is equivalent to `field(redact=True)` and is inherited by subclasses.
+
+### `snapshot_exception`
+
+```python
+snapshot_exception(
+    exc,
+    *,
+    schema_version,
+    capture_locals=False,
+    limit=253,
+)
+```
+
+Captures `exc` and everything reachable from it as an `ExceptionChain`. See
+[Snapshots](#snapshots).
+
+- `schema_version`: label stored in the result; required.
+- `capture_locals`: also record frame locals (redacted names are hidden).
+- `limit`: most exceptions to capture; the rest sets `truncated`.
+
+### `ExceptionChain`
+
+Immutable result of a snapshot, importable from `typed_exceptions.snapshot`.
+
+| Member | Description |
+| --- | --- |
+| `items` | `tuple[ExceptionSnapshot, ...]`, the captured exception first |
+| `schema_version` | Label passed by the caller |
+| `truncated` | Whether the limit left reachable exceptions out |
+| `to_dict()` | JSON-compatible dictionary |
+| `to_json()` | JSON string; unencodable values become `str()` |
+
+The module also defines `MAX_EXCEPTIONS` (253), `MAX_LOCAL_LENGTH` (200) and
+`MAX_CONTEXT_DEPTH` (8).
 
 ## Error reference
 
@@ -933,7 +1063,7 @@ It is equivalent to `field(redact=True)` and is inherited by subclasses.
 | Non-string `message_template` | `TypeError` |
 | Unsupported `dataclasses.field` option | `TypeError` |
 | Frozen class metadata | `AttributeError` |
-| Frozen `Field` attribute | `FrozenAttributeError` (subclass of `AttributeError`) |
+| Frozen `Field` attribute | `dataclasses.FrozenInstanceError` (subclass of `AttributeError`) |
 
 ## Design notes and limitations
 
@@ -959,6 +1089,13 @@ It is equivalent to `field(redact=True)` and is inherited by subclasses.
   Deleting a placeholder field freezes the last rendered message.
 - **Arbitrary instance attributes are allowed.** Assigning an unknown name
   creates a normal instance attribute; typos are not detected.
+- **Snapshot redaction is name-based.** `context` never contains redacted
+  fields, but `capture_locals=True` hides locals only by matching the names of
+  redacted fields. Renamed copies, `line_text`, literal messages and notes are
+  captured as they are.
+- **Snapshots are JSON-shaped, not round-trippable.** `context` values are
+  reduced to JSON types (`str()` for everything else) when captured, and there
+  is no way to rebuild the original exceptions from a snapshot.
 - **No dataclass semantics.** `eq`, ordering, and other dataclass-generated
   methods are not added.
 - **Python 3.14+ only.** The code uses PEP 695 generics and PEP 649 annotation
@@ -1033,12 +1170,13 @@ typed_exceptions/
 ├── src/
 │   └── typed_exceptions/
 │       ├── __init__.py           # public API: TypedException, field, Field,
-│       │                         # MISSING, Redact
+│       │                         # MISSING, Redact, snapshot_exception
 │       ├── exception.py          # runtime, metaclass, class construction
+│       ├── snapshot.py           # exception chain snapshots
 │       ├── field.py              # Field specifications, field(), dataclass interop
 │       ├── template.py           # template compilation and rendering
 │       ├── introspection.py      # PEP 649 annotation helpers
-│       ├── access.py             # frozen value objects, Redact marker
+│       ├── access.py             # Redact marker
 │       ├── sentinel.py           # MISSING sentinel
 │       └── py.typed
 ├── tests/

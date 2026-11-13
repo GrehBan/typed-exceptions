@@ -30,6 +30,7 @@ Python 3.14+.
 - [Поведение во время выполнения](#поведение-во-время-выполнения)
 - [Интроспекция](#интроспекция)
 - [Сериализация, копирование и заметки](#сериализация-копирование-и-заметки)
+- [Снимки исключений](#снимки-исключений)
 - [Проверка типов](#проверка-типов)
 - [Справочник по API](#справочник-по-api)
 - [Справочник ошибок](#справочник-ошибок)
@@ -71,6 +72,8 @@ Python 3.14+.
 - Неизменяемые скомпилированные метаданные класса и доступные только для чтения
   спецификации полей
 - Pickle, поверхностное и глубокое копирование, а также заметки исключений
+- Неизменяемые снимки цепочек исключений в формате JSON с учётом скрытых
+  полей в локальных переменных
 - Поддержка статических анализаторов типов через `dataclass_transform`
 - Отсутствие проверки типов значений полей во время выполнения
 
@@ -332,7 +335,7 @@ print(str(InvalidToken(token_id="abc", scope="admin")))
 
 Значения заполнителей отрисовываются через `str()`, а не через `repr()`. Если `__str__` значения
 выбрасывает исключение, заполнитель выводится как
-`<unprintable TypeName object>`, чтобы исходная ошибка не подменялась чужой.
+`<unprintable module.TypeName>`, чтобы исходная ошибка не подменялась чужой.
 
 Шаблон объявляется обычным атрибутом класса. Даже с аннотацией
 (`message_template: str = "..."`) он остаётся шаблоном и не становится полем.
@@ -734,7 +737,7 @@ fields["x"] = fields["user_id"]  # TypeError
 ```
 
 Объекты `Field` — неизменяемые value-объекты. Присваивание им вызывает
-`FrozenAttributeError`, подкласс `AttributeError`.
+`dataclasses.FrozenInstanceError`, подкласс `AttributeError`.
 
 Защита класса реализована метаклассом. Сочетание `TypedException` с другим
 метаклассом (`abc.ABC`, `typing.Protocol` и т. д.) вызывает `TypeError:
@@ -806,6 +809,98 @@ print(clone.context)  # {'a': 1, 'b': 'b', 'c': 1.5}
 конструктор только по именам через `_restore_exception`; устаревшее состояние
 pickle в кортеже `args` по-прежнему принимается.
 
+## Снимки исключений
+
+`TypedException.snapshot()` и `snapshot_exception()` фиксируют исключение и
+всё, что от него достижимо (`__cause__`, `__context__` и члены группы
+исключений), в виде неизменяемых простых данных. Снимок можно залогировать,
+сохранить или передать по сети, когда исходных объектов уже нет.
+
+```python
+from typed_exceptions import Redact, TypedException, snapshot_exception
+
+
+class DbError(TypedException):
+    message_template = "query failed on {table}"
+    table: str
+    password: Redact[str] = ""
+
+
+def run_query(password: str) -> None:
+    try:
+        raise ConnectionError("refused")
+    except ConnectionError as exc:
+        raise DbError(table="users", password=password) from exc
+
+
+try:
+    run_query("hunter2")
+except DbError as error:
+    chain = error.snapshot(schema_version="1", capture_locals=True)
+    short = snapshot_exception(error, schema_version="1", limit=1)
+
+top, cause = chain.items
+print(top.type, top.message)  # __main__.DbError query failed on users
+print(top.context, top.redacted)  # {'table': 'users'} ('password',)
+print(top.cause_id, cause.type)  # 1 builtins.ConnectionError
+print(cause.context)  # None
+print(top.trace[-1].locals)  # {'password': '<redacted>'}
+print(chain.truncated, short.truncated)  # False True
+print(len(short.items), short.items[0].cause_id)  # 1 None
+```
+
+`snapshot_exception(exc, *, schema_version, capture_locals=False, limit=253)`
+работает с любым исключением. У экземпляров `TypedException` есть также метод
+`snapshot()`, где `schema_version` по умолчанию равен `"1"`. Обе функции
+возвращают `ExceptionChain` (импортируется из `typed_exceptions.snapshot`) с
+полями `items`, `schema_version`, `truncated` и методами `to_dict()` и
+`to_json()`.
+
+Каждый элемент — `ExceptionSnapshot`:
+
+| Поле | Описание |
+| --- | --- |
+| `id` | Позиция в `items`; снятое исключение имеет `0` |
+| `type` | Полное имя класса, например `builtins.KeyError` |
+| `message` | `str()` исключения или заглушка, если он упал |
+| `context` | `context` у `TypedException`, `None` у остальных исключений |
+| `redacted` | Отсортированные имена скрытых полей, `None` у остальных |
+| `context_id`, `cause_id` | `id` для `__context__` / `__cause__` или `None` |
+| `suppress_context` | Значение `__suppress_context__` |
+| `group_ids` | `id` каждого снятого члена группы исключений |
+| `trace` | Кадры как `FrameSnapshot` (`file_name`, `line_number`, `name`, `line_text`, `locals`) |
+| `notes` | Заметки исключения в виде строк |
+
+Исключения ссылаются друг на друга по `id`, поэтому общая или циклическая
+цепочка остаётся конечной. Элементы идут в порядке обхода в ширину, причины
+раньше контекстов.
+
+`to_dict()` возвращает `{"root": 0, "exceptions": [...], "schema_version": ...,
+"truncated": ...}`. `schema_version` — лишь метка, которую выбираете вы;
+библиотека её не интерпретирует. `to_json()` не падает на необычных
+значениях: всё, что JSON не умеет кодировать, записывается как `str()`.
+
+### Что сохраняет снимок
+
+- **`context` отвязан от живых объектов.** Значения приводятся к типам JSON в
+  момент снимка: кортежи становятся списками, множества — отсортированными
+  списками, ключи словарей — строками, `NaN` и бесконечность — строками, а
+  любой другой объект — своим `str()`. Вложенность глубже `MAX_CONTEXT_DEPTH`
+  (8) превращается в строку. Последующие изменения исключения снимок не
+  меняют.
+- **`limit` ограничивает объём работы.** Снимается не более `limit`
+  исключений (по умолчанию `MAX_EXCEPTIONS`, 253). Если достижимых было
+  больше, `truncated` равен `True`, а ссылки на пропущенные исключения — `None`.
+- **Локальные переменные — по явному запросу.** При `capture_locals=True`
+  каждый кадр хранит `repr` своих локальных переменных, обрезанный до
+  `MAX_LOCAL_LENGTH` (200) символов. Переменные с именем любого скрытого поля
+  цепочки заменяются на `"<redacted>"`.
+
+Скрытые поля, как и везде, не попадают в `context`. Скрытие локальных
+переменных работает по имени и является эвристикой: секрет, скопированный в
+переменную с другим именем, будет снят, а `line_text`, буквальные
+переопределения сообщения и заметки не фильтруются никогда.
+
 ## Проверка типов
 
 `TypedException` декорирован через `dataclass_transform`:
@@ -876,6 +971,8 @@ class Bad(TypedException):
 - Свойство `context`, возвращающее незарезервированные и нескрытые поля.
 - Скомпилированные метаданные и замороженные атрибуты класса.
 - Поддержка pickle, копирования, глубокого копирования и заметок.
+- Метод `snapshot()`, возвращающий `ExceptionChain` (см.
+  [Снимки исключений](#снимки-исключений)).
 
 ### `field`
 
@@ -925,6 +1022,42 @@ from typed_exceptions import MISSING
 `Redact[T]` — псевдоним `Annotated[T, ...]`, который помечает поле для скрытия.
 Он эквивалентен `field(redact=True)` и наследуется подклассами.
 
+### `snapshot_exception`
+
+```python
+snapshot_exception(
+    exc,
+    *,
+    schema_version,
+    capture_locals=False,
+    limit=253,
+)
+```
+
+Фиксирует `exc` и всё достижимое от него в виде `ExceptionChain`. См.
+[Снимки исключений](#снимки-исключений).
+
+- `schema_version`: метка, сохраняемая в результате; обязательна.
+- `capture_locals`: также записывать локальные переменные кадров (скрытые имена
+  не сохраняются).
+- `limit`: наибольшее число снимаемых исключений; остальное выставляет
+  `truncated`.
+
+### `ExceptionChain`
+
+Неизменяемый результат снимка, импортируется из `typed_exceptions.snapshot`.
+
+| Член | Описание |
+| --- | --- |
+| `items` | `tuple[ExceptionSnapshot, ...]`, первым снятое исключение |
+| `schema_version` | Метка, переданная вызывающим кодом |
+| `truncated` | Остались ли достижимые исключения за пределами лимита |
+| `to_dict()` | Словарь, совместимый с JSON |
+| `to_json()` | Строка JSON; неподдерживаемые значения становятся `str()` |
+
+В модуле также определены `MAX_EXCEPTIONS` (253), `MAX_LOCAL_LENGTH` (200) и
+`MAX_CONTEXT_DEPTH` (8).
+
 ## Справочник ошибок
 
 | Ситуация | Исключение |
@@ -947,7 +1080,7 @@ from typed_exceptions import MISSING
 | `message_template` не строка | `TypeError` |
 | Неподдерживаемый параметр `dataclasses.field` | `TypeError` |
 | Замороженные метаданные класса | `AttributeError` |
-| Замороженный атрибут `Field` | `FrozenAttributeError` (подкласс `AttributeError`) |
+| Замороженный атрибут `Field` | `dataclasses.FrozenInstanceError` (подкласс `AttributeError`) |
 
 ## Замечания по дизайну и ограничения
 
@@ -973,6 +1106,13 @@ from typed_exceptions import MISSING
   шаблона обновляет сообщение, а изменение значения на месте — нет.
 - **Произвольные атрибуты экземпляра разрешены.** Присваивание неизвестного
   имени создаёт обычный атрибут экземпляра; опечатки не обнаруживаются.
+- **Скрытие в снимках работает по именам.** `context` никогда не содержит
+  скрытых полей, но `capture_locals=True` скрывает локальные переменные только
+  по совпадению с именами скрытых полей. Переименованные копии, `line_text`,
+  буквальные сообщения и заметки сохраняются как есть.
+- **Снимки имеют вид JSON и не восстанавливаются обратно.** Значения `context`
+  приводятся к типам JSON (для остального — `str()`) в момент снимка, а
+  исходные исключения по снимку восстановить нельзя.
 - **Нет семантики dataclass.** `eq`, упорядочивание и другие генерируемые
   dataclass методы не добавляются.
 - **Только Python 3.14+.** Код использует обобщения PEP 695 и обработку
@@ -1046,12 +1186,13 @@ typed_exceptions/
 ├── src/
 │   └── typed_exceptions/
 │       ├── __init__.py           # public API: TypedException, field, Field,
-│       │                         # MISSING, Redact
+│       │                         # MISSING, Redact, snapshot_exception
 │       ├── exception.py          # runtime, metaclass, class construction
+│       ├── snapshot.py           # exception chain snapshots
 │       ├── field.py              # Field specifications, field(), dataclass interop
 │       ├── template.py           # template compilation and rendering
 │       ├── introspection.py      # PEP 649 annotation helpers
-│       ├── access.py             # frozen value objects, Redact marker
+│       ├── access.py             # Redact marker
 │       ├── sentinel.py           # MISSING sentinel
 │       └── py.typed
 ├── tests/

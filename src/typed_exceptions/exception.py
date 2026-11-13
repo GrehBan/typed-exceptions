@@ -23,6 +23,7 @@ from typed_exceptions.introspection import (
     is_classvar,
 )
 from typed_exceptions.sentinel import MISSING
+from typed_exceptions.snapshot import MAX_EXCEPTIONS, ExceptionChain
 from typed_exceptions.template import (
     TEMPLATE_COMPILER,
     DynamicTemplate,
@@ -259,7 +260,7 @@ def _build_template(
     # it is assigned only after the template is rendered.
     template_fields = cls.__field_names__ - {MESSAGE}
     return DynamicTemplate(
-        *(
+        tuple(
             DynamicTemplatePart(literal, name)
             for literal, name in TEMPLATE_COMPILER.compile(
                 cls,
@@ -555,6 +556,31 @@ class TypedException(ExceptionRuntime, metaclass=FrozenClassAttrsMeta):
             context_field.name: getattr(self, context_field.name)
             for context_field in type(self).__context_fields__
         }
+
+    def snapshot(
+        self,
+        *,
+        schema_version: str = "1",
+        capture_locals: bool = False,
+        limit: int = MAX_EXCEPTIONS,
+    ) -> ExceptionChain:
+        """Capture this exception and its chain as an immutable snapshot.
+
+        Args:
+            schema_version: Version label stored in the result.
+            capture_locals: Also record the local variables of every frame;
+                names of redacted fields are hidden.
+            limit: Most exceptions to capture.
+
+        Returns:
+            The captured chain, with this exception first.
+        """
+        return ExceptionChain.from_exception(
+            self,
+            schema_version=schema_version,
+            capture_locals=capture_locals,
+            limit=limit,
+        )
 
     def __setattr__(self, name: str, value: Any) -> None:
         """Keep ``message`` and ``args`` in sync and reject invalid values."""

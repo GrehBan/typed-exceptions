@@ -21,9 +21,10 @@ from typed_exceptions import (
     field,
 )
 from typed_exceptions import exception as exception_module
-from typed_exceptions.access import frozen, should_redact
+from typed_exceptions.access import should_redact
 from typed_exceptions.exception import FrozenClassAttrsMeta
 from typed_exceptions.introspection import string_annotation_head
+from typed_exceptions.snapshot import snapshot_exception
 
 
 class UserNotFound(TypedException):
@@ -191,7 +192,7 @@ def test_field_spec_repr_and_immutability() -> None:
     spec = Field[int](default=1)
     assert "Field(name=''" in repr(spec)
     with pytest.raises(AttributeError):
-        spec.default = 2
+        spec.default = 2  # type: ignore[misc]
     with pytest.raises(AttributeError):
         del spec.default
 
@@ -645,7 +646,8 @@ def test_rerender_tolerates_unprintable_values() -> None:
 
     error = Ticket(number=1)
     error.number = Broken()  # type: ignore[assignment]
-    assert str(error) == "ticket <unprintable Broken object>"
+    name = f"{Broken.__module__}.{Broken.__qualname__}"
+    assert str(error) == f"ticket <unprintable {name}>"
 
 
 def test_in_place_mutation_does_not_rerender() -> None:
@@ -674,7 +676,8 @@ def test_unprintable_field_value_does_not_replace_the_error() -> None:
         obj: object
 
     error = WithObject(obj=Broken())
-    assert str(error) == "object <unprintable Broken object>"
+    name = f"{Broken.__module__}.{Broken.__qualname__}"
+    assert str(error) == f"object <unprintable {name}>"
     assert isinstance(error.obj, Broken)
 
 
@@ -1083,7 +1086,7 @@ def test_field_survives_copy_and_pickle(name: str) -> None:
         assert clone is not original
         assert repr(clone) == repr(original)
         with pytest.raises(AttributeError):
-            clone.name = "changed"
+            clone.name = "changed"  # type: ignore[misc]
 
 
 def test_template_survives_copy_and_pickle() -> None:
@@ -1105,6 +1108,273 @@ def test_template_survives_copy_and_pickle() -> None:
         assert part_clone.name == part.name
 
 
+def test_field_spec_compares_and_hashes_by_value() -> None:
+    """Verify equal field specifications are interchangeable."""
+    first = Field[int](default=1, name="a")
+    assert first == Field[int](default=1, name="a")
+    assert hash(first) == hash(Field[int](default=1, name="a"))
+    assert first != Field[int](default=2, name="a")
+    assert first != Field[int](default=1, name="b")
+    assert len({first, Field[int](default=1, name="a")}) == 1
+
+
+def test_field_spec_positional_order_is_stable() -> None:
+    """Verify the positional constructor order of ``Field`` is preserved."""
+    spec = Field(1, MISSING, True, True, "x")
+    assert (spec.default, spec.factory) == (1, MISSING)
+    assert (spec.redact, spec.reserved, spec.name) == (True, True, "x")
+
+
+def test_dynamic_template_derives_names_from_parts() -> None:
+    """Verify ``names`` follows ``parts`` and the empty template is static."""
+    from typed_exceptions.template import DynamicTemplate, DynamicTemplatePart
+
+    empty = DynamicTemplate()
+    assert empty.parts == ()
+    assert empty.names == frozenset()
+    assert empty.is_static
+
+    template = DynamicTemplate(
+        (DynamicTemplatePart("a "), DynamicTemplatePart(" b", "x"))
+    )
+    assert template.names == {"x"}
+    assert template == DynamicTemplate(template.parts)
+    assert hash(template) == hash(DynamicTemplate(template.parts))
+    with pytest.raises(AttributeError):
+        template.names = frozenset()  # type: ignore[misc]
+
+
+def test_exception_snapshots_are_frozen_values() -> None:
+    """Verify snapshot objects are immutable and compare by value."""
+    from typed_exceptions.snapshot import FrameSnapshot
+
+    frame = FrameSnapshot("f.py", 1, "run", "x = 1", None)
+    assert frame == FrameSnapshot("f.py", 1, "run", "x = 1", None)
+    with pytest.raises(AttributeError):
+        frame.name = "other"  # type: ignore[misc]
+
+    chain = UserNotFound(user_id=1).snapshot()
+    assert chain.items[0].type.endswith("UserNotFound")
+    with pytest.raises(AttributeError):
+        chain.schema_version = "2"  # type: ignore[misc]
+    assert chain.to_dict()["root"] == 0
+
+
+class _SecretHolder(TypedException):
+    message_template = "secret holder"
+    token: Redact[str]
+
+
+def _raise_secret_holder(token: str) -> None:
+    password = "hunter2"
+    assert password
+    raise _SecretHolder(token=token)
+
+
+def test_snapshot_to_json_survives_unserializable_context() -> None:
+    """Verify ``to_json`` stringifies values JSON cannot encode."""
+    import datetime
+    import json
+    import uuid
+
+    class WithValues(TypedException):
+        message_template = "values"
+        when: datetime.datetime
+        ident: uuid.UUID
+
+    error = WithValues(
+        when=datetime.datetime(2026, 1, 2), ident=uuid.UUID(int=1)
+    )
+    context = json.loads(error.snapshot().to_json())["exceptions"][0][
+        "context"
+    ]
+    assert context == {
+        "when": "2026-01-02 00:00:00",
+        "ident": str(uuid.UUID(int=1)),
+    }
+
+
+def test_snapshot_locals_hide_redacted_names() -> None:
+    """Verify captured locals do not leak a redacted field by name."""
+    # Built at runtime so the literal is not echoed back by ``line_text``.
+    token = "".join(("s3", "cr3t"))
+    try:
+        _raise_secret_holder(token)
+    except _SecretHolder as error:
+        chain = error.snapshot(capture_locals=True)
+
+    frames = {frame.name: frame for frame in chain.items[0].trace}
+    local = frames["_raise_secret_holder"].locals
+    assert local is not None
+    assert local["token"] == "<redacted>"
+    assert local["password"] == "'hunter2'"
+    assert "s3cr3t" not in chain.to_json()
+
+
+def test_snapshot_locals_are_clipped() -> None:
+    """Verify very long local reprs are clipped to a fixed length."""
+    from typed_exceptions.snapshot import (
+        MAX_LOCAL_LENGTH,
+        snapshot_exception,
+    )
+
+    def boom(blob: str) -> None:
+        raise ValueError(blob[:1])
+
+    try:
+        boom("a" * 1000)
+    except ValueError as error:
+        chain = snapshot_exception(
+            error, schema_version="1", capture_locals=True
+        )
+
+    local = chain.items[0].trace[-1].locals
+    assert local is not None
+    assert len(local["blob"]) == MAX_LOCAL_LENGTH
+    assert local["blob"].endswith("\u2026")
+
+
+def test_snapshot_reports_truncation() -> None:
+    """Verify ``truncated`` tells a cut chain from a complete one."""
+    from typed_exceptions.snapshot import snapshot_exception
+
+    inner = ValueError("inner")
+    outer = KeyError("outer")
+    outer.__cause__ = inner
+
+    assert snapshot_exception(outer, schema_version="1").truncated is False
+    exact = snapshot_exception(outer, schema_version="1", limit=2)
+    assert exact.truncated is False
+    assert len(exact.items) == 2
+
+    cut = snapshot_exception(outer, schema_version="1", limit=1)
+    assert cut.truncated is True
+    assert len(cut.items) == 1
+    assert cut.items[0].cause_id is None
+    assert cut.to_dict()["truncated"] is True
+
+    none = snapshot_exception(outer, schema_version="1", limit=0)
+    assert none.items == ()
+    assert none.truncated is True
+
+
+def test_snapshot_redacted_names_are_sorted() -> None:
+    """Verify the redacted names come out in a stable order."""
+
+    class Many(TypedException):
+        message_template = "many"
+        b: Redact[str] = field(default="")
+        a: Redact[str] = field(default="")
+        c: Redact[str] = field(default="")
+
+    assert Many().snapshot().items[0].redacted == ("a", "b", "c")
+
+
+def test_snapshot_tells_typed_from_plain_exceptions() -> None:
+    """Verify no redactions (``[]``) differs from not typed (``None``)."""
+    from typed_exceptions.snapshot import snapshot_exception
+
+    typed = UserNotFound(user_id=1).snapshot().to_dict()["exceptions"][0]
+    assert typed["redacted"] == []
+    assert typed["context"] == {"user_id": 1}
+
+    plain = snapshot_exception(ValueError("x"), schema_version="1")
+    entry = plain.to_dict()["exceptions"][0]
+    assert entry["redacted"] is None
+    assert entry["context"] is None
+
+
+def test_snapshot_notes_tolerate_odd_values() -> None:
+    """Verify malformed ``__notes__`` cannot break a snapshot."""
+    from typed_exceptions.snapshot import snapshot_exception
+
+    error = ValueError("x")
+    setattr(error, "__notes__", ["a", 1])
+    assert snapshot_exception(error, schema_version="1").items[0].notes == (
+        "a",
+        "1",
+    )
+    setattr(error, "__notes__", "abc")
+    assert snapshot_exception(error, schema_version="1").items[0].notes == ()
+
+
+def test_snapshot_context_is_reduced_to_json_types() -> None:
+    """Verify captured context holds plain JSON values only."""
+    import datetime
+    import json
+    import uuid
+
+    class Odd:
+        def __str__(self) -> str:
+            return "odd"
+
+    class Rich(TypedException):
+        message_template = "rich"
+        payload: object
+
+    payload = {
+        "when": datetime.datetime(2026, 1, 2),
+        "ids": (uuid.UUID(int=1), 2),
+        "tags": {"b", "a"},
+        3: Odd(),
+        "nan": float("nan"),
+        "inf": float("inf"),
+        "ok": 1.5,
+    }
+    context = Rich(payload=payload).snapshot().items[0].context
+    assert context == {
+        "payload": {
+            "when": "2026-01-02 00:00:00",
+            "ids": [str(uuid.UUID(int=1)), 2],
+            "tags": ["a", "b"],
+            "3": "odd",
+            "nan": "nan",
+            "inf": "inf",
+            "ok": 1.5,
+        }
+    }
+    assert json.dumps(context, allow_nan=False)
+
+
+def test_snapshot_context_is_detached_from_live_objects() -> None:
+    """Verify later changes to a field do not alter the snapshot."""
+
+    class Holder(TypedException):
+        message_template = "holder"
+        items: list[int]
+
+    error = Holder(items=[1, 2])
+    chain = error.snapshot()
+    error.items.append(3)
+    error.items = [9]
+    context = chain.items[0].context
+    assert context == {"items": [1, 2]}
+    assert chain.to_dict()["exceptions"][0]["context"] is context
+
+
+def test_snapshot_context_survives_hostile_values() -> None:
+    """Verify cycles, deep nesting and broken containers do not raise."""
+
+    class BrokenMapping(dict[str, int]):
+        def items(self) -> typing.Any:
+            raise RuntimeError("boom")
+
+    class Hostile(TypedException):
+        message_template = "hostile"
+        value: object
+
+    loop: list[object] = []
+    loop.append(loop)
+    deep: object = 0
+    for _ in range(50):
+        deep = [deep]
+
+    for value in (loop, deep, BrokenMapping(a=1)):
+        chain = Hostile(value=value).snapshot()
+        assert chain.items[0].context is not None
+        assert chain.to_json()
+
+
 def test_public_api_is_exported_from_package_root() -> None:
     """Verify the package root re-exports the public API."""
     import typed_exceptions
@@ -1114,12 +1384,14 @@ def test_public_api_is_exported_from_package_root() -> None:
     assert typed_exceptions.Redact is Redact
     assert typed_exceptions.MISSING is MISSING
     assert typed_exceptions.field is field
+    assert typed_exceptions.snapshot_exception is snapshot_exception
     assert set(typed_exceptions.__all__) == {
         "MISSING",
         "Field",
         "Redact",
         "TypedException",
         "field",
+        "snapshot_exception",
     }
 
 
@@ -1462,24 +1734,6 @@ def test_finalize_requires_message_field() -> None:
         exception_module._finalize_fields(
             UserNotFound, {}, {}, set(), frozenset()
         )
-
-
-def test_frozen_decorator_excludes_class_vars() -> None:
-    """Verify frozen objects allow instance shadows of ClassVar attributes."""
-
-    @frozen
-    class FrozenValue:
-        constant: ClassVar[int] = 1
-        value: int = 2
-
-    class FrozenValueChild(FrozenValue):
-        pass
-
-    instance = FrozenValueChild()
-    setattr(instance, "constant", 3)
-    assert getattr(instance, "constant") == 3
-    with pytest.raises(AttributeError):
-        instance.value = 4
 
 
 def test_fields_mapping_is_read_only() -> None:

@@ -1,6 +1,6 @@
 [project]
 name = "typed-exceptions"
-version = "0.2.1"
+version = "0.3.0"
 description = "Exceptions with typed, structured context and message templates"
 keywords = [
     "exceptions",
@@ -129,6 +129,7 @@ name = "Package layers"
 type = "layers"
 layers = [
     "typed_exceptions.exception",
+    "typed_exceptions.snapshot",
     "typed_exceptions.template",
     "typed_exceptions.field",
     "typed_exceptions.access",

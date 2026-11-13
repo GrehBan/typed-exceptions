@@ -4,6 +4,7 @@ from typed_exceptions.access import Redact
 from typed_exceptions.exception import TypedException
 from typed_exceptions.field import Field, field
 from typed_exceptions.sentinel import MISSING
+from typed_exceptions.snapshot import snapshot_exception
 
 __all__ = (
     "MISSING",
@@ -11,4 +12,5 @@ __all__ = (
     "Redact",
     "TypedException",
     "field",
+    "snapshot_exception",
 )

@@ -13,7 +13,6 @@ from typing import (
     runtime_checkable,
 )
 
-from typed_exceptions.access import frozen
 from typed_exceptions.sentinel import MISSING
 
 DEFAULT_REDACT: Final[bool] = False
@@ -86,47 +85,28 @@ def _is_hashable(value: object) -> bool:
     return True
 
 
-@frozen
+@dataclasses.dataclass(frozen=True, slots=True, repr=False)
 class Field[T]:
     """Immutable specification of one exception field.
 
+    The constructor takes ``default``, ``factory``, ``redact``, ``reserved``
+    and ``name`` in that order. ``name`` is usually bound later by
+    ``__set_name__``.
+
     Attributes:
-        name: Field name.
         default: Default value, or ``MISSING``.
         factory: Zero-argument default factory, or ``MISSING``.
         redact: Whether the value is hidden from ``context`` and templates.
         reserved: Whether the value is hidden from ``context``.
+        name: Field name.
     """
 
-    __slots__ = ("name", "default", "factory", "redact", "reserved")
-    name: str
-    default: DefaultAttr[T]
-    factory: FactoryAttr[T]
-    redact: bool
-    reserved: bool
-
-    def __init__(
-        self,
-        default: DefaultAttr[T] = MISSING,
-        factory: FactoryAttr[T] = MISSING,
-        redact: bool = DEFAULT_REDACT,
-        reserved: bool = DEFAULT_RESERVED,
-        name: str = "",
-    ) -> None:
-        """Initialize the field specification.
-
-        Args:
-            default: Default value, or ``MISSING``.
-            factory: Zero-argument default factory, or ``MISSING``.
-            redact: Whether to hide the value from ``context`` and templates.
-            reserved: Whether to hide the value from ``context`` only.
-            name: Field name; usually bound later by ``__set_name__``.
-        """
-        object.__setattr__(self, "name", name)
-        object.__setattr__(self, "default", default)
-        object.__setattr__(self, "factory", factory)
-        object.__setattr__(self, "redact", redact)
-        object.__setattr__(self, "reserved", reserved)
+    # Declaration order is the positional constructor order.
+    default: DefaultAttr[T] = MISSING
+    factory: FactoryAttr[T] = MISSING
+    redact: bool = DEFAULT_REDACT
+    reserved: bool = DEFAULT_RESERVED
+    name: str = ""
 
     def __set_name__(self, owner: type, name: str) -> None:
         """Bind the attribute name when the field is declared in a class."""
@@ -150,22 +130,11 @@ class Field[T]:
             return self.default
         return factory()
 
-    def __reduce__(self) -> tuple[Any, tuple[Any, ...]]:
-        """Rebuild the field through its constructor.
-
-        The default slot-based reduction assigns attributes, which the frozen
-        field rejects, so copying and pickling would fail.
-        """
-        return type(self), (
-            self.default,
-            self.factory,
-            self.redact,
-            self.reserved,
-            self.name,
-        )
-
     def __repr__(self) -> str:
-        """Return a debug representation of the field."""
+        """Return a debug representation of the field.
+
+        Kept by hand so ``name`` comes first, unlike the constructor order.
+        """
         return (
             f"Field(name={self.name!r}, default={self.default!r}, "
             f"factory={self.factory!r}, redact={self.redact!r}, "
